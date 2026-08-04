@@ -63,24 +63,3 @@ venues:
     aliases: [aaai]
     rank: A*
     tags: [ml]
-
-  - id: HCI
-    name: International Conference on Human-Computer Interaction
-    dblp_stream: conf/hci
-    aliases: [hci]
-    rank: A*
-    tags: [hci]
-
-  - id: FAccT
-    name: ACM Conference on Fairness, Accountability and Transparency
-    dblp_stream: conf/fat
-    aliases: [facct]
-    rank: A*
-    tags: [ml, fairness]
-
-  - id: CHI
-    name: ACM Conference on Human Factors in Computing Systems
-    dblp_stream: conf/chi
-    aliases: [chi]
-    rank: A*
-    tags: [hci]
