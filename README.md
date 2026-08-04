@@ -106,11 +106,13 @@ cs-grep '* WHERE tag:ml OR tag:security'
 
 Bundles choose which venue catalogs `update` and `enrich` process. Tags filter
 papers by venue family during search. Bundled venues use the broad tags
-`security`, `ml`, `nlp`, `cv`, and `se`; custom venues can define additional
-tags.
+`security`, `ml`, `nlp`, `cv`, `se`, and `hci`; custom venues can define
+additional tags. The default bundles are `security`, `ml`, and `se`; `hci` is
+available separately.
 
 ```sh
 cs-grep update --bundle security,ml
+cs-grep update --bundle hci
 cs-grep enrich --bundle ml
 ```
 
@@ -124,7 +126,8 @@ cs-grep '(prompt injection OR jailbreak) WHERE tag:ml AND tag:security'
 
 ## Venues
 
-Bundled venue catalogs live in `crates/cs-grep-core/venues/`.
+The bundled venue catalogs are listed in
+[`crates/cs-grep-core/venues/`](crates/cs-grep-core/venues/).
 
 After `cs-grep init`, you can extend or override the catalog with a user
 `config.yaml`:

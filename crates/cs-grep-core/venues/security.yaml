@@ -77,3 +77,10 @@ venues:
     aliases: [satml]
     rank: A
     tags: [security, ml]
+
+  - id: SOUPS
+    name: Symposium on Usable Privacy and Security
+    dblp_stream: conf/soups
+    aliases: [soups]
+    rank: A
+    tags: [security, hci]

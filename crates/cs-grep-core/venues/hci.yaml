@@ -1,0 +1,21 @@
+# Human-computer interaction venues bundled with cs-grep.
+
+venues:
+  - id: CHI
+    name: ACM Conference on Human Factors in Computing Systems
+    dblp_stream: conf/chi
+    aliases: [chi]
+    rank: A*
+    tags: [hci]
+
+  - id: HCII
+    name: International Conference on Human-Computer Interaction
+    dblp_stream: conf/hci
+    aliases: [hcii, hci-international]
+    tags: [hci]
+
+  - id: FAccT
+    name: ACM Conference on Fairness, Accountability, and Transparency
+    dblp_stream: conf/fat
+    aliases: [facct, fat]
+    tags: [hci, ml]

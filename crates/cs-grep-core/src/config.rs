@@ -13,6 +13,7 @@ const BUNDLED_VENUES: &[(&str, &str)] = &[
     ("security", include_str!("../venues/security.yaml")),
     ("ml", include_str!("../venues/ml.yaml")),
     ("se", include_str!("../venues/se.yaml")),
+    ("hci", include_str!("../venues/hci.yaml")),
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -370,8 +371,8 @@ mod tests {
 
     #[test]
     fn bundled_tags_match_venue_families() {
-        let cfg = Config::defaults().unwrap();
-        let expected: [(&str, &[&str]); 5] = [
+        let cfg = Config::from_yaml("bundles: [security, ml, se, hci]\n").unwrap();
+        let expected: [(&str, &[&str]); 6] = [
             (
                 "security",
                 &[
@@ -386,18 +387,20 @@ mod tests {
                     "EuroSP",
                     "AISec",
                     "SaTML",
+                    "SOUPS",
                 ],
             ),
             (
                 "ml",
                 &[
                     "AISec", "SaTML", "NeurIPS", "ICML", "ICLR", "ACL", "EMNLP", "CVPR", "ICCV",
-                    "IJCAI", "AAAI",
+                    "IJCAI", "AAAI", "FAccT",
                 ],
             ),
             ("nlp", &["ACL", "EMNLP"]),
             ("cv", &["CVPR", "ICCV"]),
             ("se", &["ICSE", "FSE", "ASE"]),
+            ("hci", &["CHI", "HCII", "FAccT", "SOUPS"]),
         ];
 
         let actual_tags = cfg
