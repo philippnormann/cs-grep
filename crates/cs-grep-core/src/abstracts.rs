@@ -118,7 +118,7 @@ fn abstracts_from_openalex_works(
             .filter(|doi| {
                 expected_titles
                     .get(doi)
-                    .is_some_and(|title| json_title_matches(work, title))
+                    .is_some_and(|title| json_doi_title_matches(work, title))
             })
         else {
             continue;
@@ -149,7 +149,7 @@ fn abstracts_from_semantic_scholar_batch(
             .filter(|doi| {
                 expected_titles
                     .get(doi)
-                    .is_some_and(|title| json_title_matches(paper, title))
+                    .is_some_and(|title| json_doi_title_matches(paper, title))
             })
         else {
             continue;
@@ -234,12 +234,26 @@ fn titles_match(actual: &str, expected: &str) -> bool {
     normalized_match_text(actual) == normalized_match_text(expected)
 }
 
-fn json_title_matches(value: &Value, expected: &str) -> bool {
+fn doi_titles_match(actual: &str, expected: &str) -> bool {
+    titles_match(actual, expected)
+        || subtitle_prefix_matches(actual, expected)
+        || subtitle_prefix_matches(expected, actual)
+}
+
+fn subtitle_prefix_matches(longer: &str, shorter: &str) -> bool {
+    [":", " - ", " – ", " — "].iter().any(|delimiter| {
+        longer
+            .match_indices(delimiter)
+            .any(|(index, _)| titles_match(&longer[..index], shorter))
+    })
+}
+
+fn json_doi_title_matches(value: &Value, expected: &str) -> bool {
     value
         .get("title")
         .or_else(|| value.get("display_name"))
         .and_then(|v| v.as_str())
-        .is_some_and(|title| titles_match(title, expected))
+        .is_some_and(|title| doi_titles_match(title, expected))
 }
 
 fn usable_abstract_for_title(raw: String, title: &str) -> Option<String> {
@@ -306,7 +320,7 @@ fn crossref_title_matches(message: &Value, expected: &str) -> bool {
         .and_then(|v| v.as_array())
         .and_then(|titles| titles.first())
         .and_then(|v| v.as_str())
-        .is_some_and(|title| titles_match(title, expected))
+        .is_some_and(|title| doi_titles_match(title, expected))
 }
 
 fn collapse_ws(s: &str) -> String {
@@ -441,6 +455,14 @@ fn is_boilerplate_abstract(text: &str) -> bool {
         || text.starts_with("This repository contains ")
         || (text.len() < 300 && text.starts_with("Warning:"))
         || (text.len() < 300 && text.contains(" to me ") && text.contains("I am "))
+        || (text.contains("Authors Info & Claims")
+            && text.contains("View Profile")
+            && text.contains("Get Citation Alerts"))
+        || text
+            .strip_prefix('\'')
+            .and_then(|text| text.strip_suffix('\''))
+            .and_then(|text| text.split_once("' published in '"))
+            .is_some_and(|(title, publication)| !title.is_empty() && !publication.is_empty())
         || ((text.contains("Proceedings of ") || text.contains("Findings of "))
             && ((year.len() == 4 && year.chars().all(|c| c.is_ascii_digit()))
                 || text.contains(". In: ")))
@@ -495,11 +517,20 @@ fn non_empty_text(text: impl AsRef<str>) -> Option<String> {
 }
 
 fn strip_abstract_heading(text: &str) -> &str {
-    let text = ["Abstract:", "Abstract -", "Abstract –", "Abstract —"]
+    let Some(rest) = text
+        .get(.."Abstract".len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case("Abstract"))
+        .and_then(|_| text.get("Abstract".len()..))
+    else {
+        return text;
+    };
+    if let Some(rest) = [":", ".", " -", " –", " —"]
         .iter()
-        .find_map(|prefix| text.strip_prefix(prefix).map(str::trim_start))
-        .unwrap_or(text);
-    text.strip_prefix("Abstract ")
+        .find_map(|separator| rest.strip_prefix(separator))
+    {
+        return rest.trim_start();
+    }
+    rest.strip_prefix(' ')
         .filter(|rest| {
             let mut words = rest.split_whitespace();
             words
@@ -512,13 +543,28 @@ fn strip_abstract_heading(text: &str) -> &str {
         .unwrap_or(text)
 }
 
-fn static_page_title_matches(html: &str, expected: &str) -> bool {
+fn static_page_title_matches(html: &str, paper: &Paper) -> bool {
     let doc = Html::parse_document(html);
     let selector = Selector::parse("meta[name='citation_title']").expect("valid selector");
-    doc.select(&selector)
+    let Some(title) = doc
+        .select(&selector)
         .next()
         .and_then(|element| element.value().attr("content"))
-        .is_none_or(|title| titles_match(title, expected))
+    else {
+        return true;
+    };
+    if titles_match(title, &paper.title) {
+        return true;
+    }
+    let Some(doi) = paper.doi.as_deref().and_then(normalized_doi) else {
+        return false;
+    };
+    let selector = Selector::parse("meta[name='citation_doi']").expect("valid selector");
+    doc.select(&selector)
+        .filter_map(|element| element.value().attr("content"))
+        .filter_map(normalized_doi)
+        .any(|page_doi| page_doi == doi)
+        && doi_titles_match(title, &paper.title)
 }
 
 fn decode_html_entities(s: &str) -> String {
@@ -781,7 +827,7 @@ impl Enricher {
             .fetch_semantic_scholar_json(self.client.get(&s2))
             .await
             .ok()
-            .filter(|json| json_title_matches(json, &paper.title))
+            .filter(|json| json_doi_title_matches(json, &paper.title))
             .and_then(|json| abstract_from_semantic_scholar(&json))
             .and_then(|abs| usable_abstract_for_title(abs, &paper.title))
         {
@@ -792,7 +838,7 @@ impl Enricher {
             .fetch_openalex_json(&format!("https://api.openalex.org/works/doi:{doi}"), &[])
             .await
             .ok()
-            .filter(|json| json_title_matches(json, &paper.title))
+            .filter(|json| json_doi_title_matches(json, &paper.title))
             .and_then(|json| abstract_from_openalex(&json))
             .and_then(|abs| usable_abstract_for_title(abs, &paper.title))
         {
@@ -1127,7 +1173,7 @@ impl Enricher {
                     "static page too large or unreadable".into(),
                 ));
             };
-            if !static_page_title_matches(&html, &paper.title) {
+            if !static_page_title_matches(&html, paper) {
                 return Ok(EnrichResult::Missing(
                     "static page title did not match paper".into(),
                 ));
@@ -1482,6 +1528,8 @@ mod tests {
             "Electronic proceedings of IJCAI 2024 with additional publication information",
             "Paper presented at a workshop with enough bibliographic details to exceed the minimum accepted abstract length by a wide margin.",
             "This repository contains code, datasets, devices, and usage instructions for reproducing the paper's experiments and released models.",
+            "'Artificial Intelligence Enhancement for Remote Virtual Consultations in Healthcare Provision for Patients with Chronic Conditions' published in 'HCI International 2023 Posters'",
+            "extended-abstract Share on Paper title Authors Info & Claims Alice Example View Profile Article No.: 1 Get Citation Alerts Save to Binder Export Citation Publisher Site Get Access",
             "Alice Example. A paper title. In: Findings of the Association for Computational Linguistics: EMNLP 2023. 2023: 1-10.",
             "https:",
             "https://doi.org/10.18653/v1/2023.acl-long.361",
@@ -1494,6 +1542,14 @@ mod tests {
     #[test]
     fn sanitizes_and_rejects_observed_bad_abstracts() {
         let abs = fixture_abstract("Clean abstract.");
+        assert_eq!(
+            abstract_text(format!("Abstract. {abs}")).as_deref(),
+            Some(abs.as_str())
+        );
+        assert_eq!(
+            abstract_text(format!("ABSTRACT {abs}")).as_deref(),
+            Some(abs.as_str())
+        );
         assert_eq!(
             abstract_text(format!("{abs} CCS CONCEPTS • Security and privacy")).as_deref(),
             Some(abs.as_str())
@@ -1533,6 +1589,23 @@ mod tests {
     fn abstract_length_limits_count_characters() {
         assert!(abstract_text(format!("{}.", "界".repeat(30))).is_none());
         assert!(abstract_text(format!("{}.", "界".repeat(2_000))).is_some());
+    }
+
+    #[test]
+    fn doi_title_matching_accepts_only_subtitle_boundaries() {
+        assert!(doi_titles_match(
+            "Privacy Interventions and Education",
+            "Privacy Interventions and Education: Encouraging Protective Behavior"
+        ));
+        assert!(doi_titles_match(
+            "A Study: Methods",
+            "A Study: Methods: Methods"
+        ));
+        assert!(!doi_titles_match(
+            "Privacy Interventions",
+            "Privacy Interventions and Education"
+        ));
+        assert!(!doi_titles_match("A Study: Methods", "A Study: Results"));
     }
 
     #[test]
@@ -1585,16 +1658,29 @@ mod tests {
 
     #[test]
     fn static_page_citation_title_must_match() {
-        let expected = "A Paper: With Punctuation.";
+        let mut expected = paper("A Paper: With Punctuation.");
         assert!(static_page_title_matches(
             r#"<meta name="citation_title" content="A Paper - With Punctuation">"#,
-            expected
+            &expected
         ));
         assert!(!static_page_title_matches(
             r#"<meta name="citation_title" content="Another Paper">"#,
-            expected
+            &expected
         ));
-        assert!(static_page_title_matches("<html></html>", expected));
+        assert!(!static_page_title_matches(
+            r#"<meta name="citation_title" content="A Paper">"#,
+            &expected
+        ));
+        expected.doi = Some("10.1000/example".into());
+        assert!(static_page_title_matches(
+            r#"<meta name="citation_title" content="A Paper"><meta name="citation_doi" content="https://doi.org/10.1000/example">"#,
+            &expected
+        ));
+        assert!(!static_page_title_matches(
+            r#"<meta name="citation_title" content="A Paper"><meta name="citation_doi" content="10.1000/wrong">"#,
+            &expected
+        ));
+        assert!(static_page_title_matches("<html></html>", &expected));
     }
 
     #[test]
