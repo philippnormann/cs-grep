@@ -29,6 +29,8 @@ const MAX_STATIC_REDIRECTS: usize = 5;
 const MAX_RATE_LIMIT_SLEEP: Duration = Duration::from_secs(65);
 const OPENREVIEW_BATCH_SIZE: usize = 500;
 const OPENREVIEW_LOGIN_EXPIRES_IN: u64 = 7 * 24 * 60 * 60;
+const OPENREVIEW_API_V1: usize = 0;
+const OPENREVIEW_API_V2: usize = 1;
 const SEMANTIC_SCHOLAR_BATCH_SIZE: usize = 500;
 const OPENALEX_BATCH_SIZE: usize = 100;
 const TRANSIENT_RETRY_DELAY: Duration = Duration::from_millis(250);
@@ -621,7 +623,7 @@ pub struct Enricher {
     secrets: Secrets,
     openreview_cache: HashMap<String, String>,
     doi_cache: HashMap<String, Option<String>>,
-    openreview_login_token: OnceLock<String>,
+    openreview_login_tokens: [OnceLock<String>; 2],
 }
 
 pub enum EnrichResult {
@@ -650,6 +652,14 @@ fn store_doi_batch_results(
     }
 }
 
+fn openreview_auth_target(url: &str) -> Option<(usize, &'static str)> {
+    if url.starts_with("https://api2.openreview.net/") {
+        return Some((OPENREVIEW_API_V2, "https://api2.openreview.net/login"));
+    }
+    url.starts_with("https://api.openreview.net/")
+        .then_some((OPENREVIEW_API_V1, "https://api.openreview.net/login"))
+}
+
 impl Enricher {
     pub fn new(secrets: Secrets) -> Self {
         let client = reqwest::Client::builder()
@@ -664,7 +674,7 @@ impl Enricher {
             secrets,
             openreview_cache: HashMap::new(),
             doi_cache: HashMap::new(),
-            openreview_login_token: OnceLock::new(),
+            openreview_login_tokens: [OnceLock::new(), OnceLock::new()],
         }
     }
 
@@ -995,36 +1005,35 @@ impl Enricher {
 
     async fn openreview_get(&self, url: &str) -> reqwest::RequestBuilder {
         let req = self.client.get(url);
-        if url.contains("api2.openreview.net") {
-            if let Some(token) = self.openreview_login_token().await {
-                return req.header(header::AUTHORIZATION, format!("Bearer {token}"));
-            }
+        let Some((api, login_url)) = openreview_auth_target(url) else {
+            return req;
+        };
+        if let Some(token) = self.openreview_login_token(api, login_url).await {
+            return req.header(header::AUTHORIZATION, format!("Bearer {token}"));
         }
         req
     }
 
-    async fn openreview_login_token(&self) -> Option<String> {
-        if let Some(token) = self.openreview_login_token.get() {
+    async fn openreview_login_token(&self, api: usize, login_url: &str) -> Option<String> {
+        let token_cache = &self.openreview_login_tokens[api];
+        if let Some(token) = token_cache.get() {
             return Some(token.clone());
         }
-        let token = self.openreview_login().await;
+        let token = self.openreview_login(login_url).await;
         if let Some(token) = &token {
-            let _ = self.openreview_login_token.set(token.clone());
+            let _ = token_cache.set(token.clone());
         }
         token
     }
 
-    async fn openreview_login(&self) -> Option<String> {
+    async fn openreview_login(&self, login_url: &str) -> Option<String> {
         let username = self.secrets.openreview_username.as_deref()?;
         let password = self.secrets.openreview_password.as_deref()?;
-        let req = self
-            .client
-            .post("https://api2.openreview.net/login")
-            .json(&serde_json::json!({
-                "id": username,
-                "password": password,
-                "expiresIn": OPENREVIEW_LOGIN_EXPIRES_IN,
-            }));
+        let req = self.client.post(login_url).json(&serde_json::json!({
+            "id": username,
+            "password": password,
+            "expiresIn": OPENREVIEW_LOGIN_EXPIRES_IN,
+        }));
         let json = self.fetch_json(req, RateLimitRetry::Disabled).await.ok()?;
         json.get("token")
             .and_then(|token| token.as_str())
@@ -1461,6 +1470,58 @@ mod tests {
 
     fn extract_abstract_html(html: &str, source: Option<AbstractSource>) -> Option<String> {
         abstract_candidates(html, source).into_iter().next()
+    }
+
+    #[test]
+    fn openreview_auth_routes_both_api_versions() {
+        assert_eq!(
+            openreview_auth_target("https://api2.openreview.net/notes"),
+            Some((OPENREVIEW_API_V2, "https://api2.openreview.net/login"))
+        );
+        assert_eq!(
+            openreview_auth_target("https://api.openreview.net/notes"),
+            Some((OPENREVIEW_API_V1, "https://api.openreview.net/login"))
+        );
+        assert_eq!(
+            openreview_auth_target("https://api.openreview.net.evil/notes"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn openreview_requests_keep_tokens_scoped_to_each_api() {
+        let enricher = Enricher::new(Secrets::default());
+        enricher.openreview_login_tokens[OPENREVIEW_API_V1]
+            .set("api1-token".into())
+            .unwrap();
+        enricher.openreview_login_tokens[OPENREVIEW_API_V2]
+            .set("api2-token".into())
+            .unwrap();
+        for (url, expected) in [
+            (
+                "https://api.openreview.net/notes",
+                Some("Bearer api1-token"),
+            ),
+            (
+                "https://api2.openreview.net/notes",
+                Some("Bearer api2-token"),
+            ),
+            ("https://api.openreview.net.example/notes", None),
+            ("https://api2.openreview.net.example/notes", None),
+            ("https://example.com/api2.openreview.net/notes", None),
+            ("http://api.openreview.net/notes", None),
+            ("http://api2.openreview.net/notes", None),
+        ] {
+            let request = enricher.openreview_get(url).await.build().unwrap();
+            assert_eq!(
+                request
+                    .headers()
+                    .get(header::AUTHORIZATION)
+                    .map(|h| h.to_str().unwrap()),
+                expected,
+                "{url}"
+            );
+        }
     }
 
     #[test]
