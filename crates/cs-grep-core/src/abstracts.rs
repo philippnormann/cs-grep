@@ -27,7 +27,7 @@ const MAX_JSON_BODY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_HTML_BODY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_STATIC_REDIRECTS: usize = 5;
 const MAX_RATE_LIMIT_SLEEP: Duration = Duration::from_secs(65);
-const OPENREVIEW_PAGE_SIZE: usize = 500;
+const OPENREVIEW_BATCH_SIZE: usize = 500;
 const OPENREVIEW_LOGIN_EXPIRES_IN: u64 = 7 * 24 * 60 * 60;
 const SEMANTIC_SCHOLAR_BATCH_SIZE: usize = 500;
 const OPENALEX_BATCH_SIZE: usize = 100;
@@ -619,7 +619,7 @@ fn decode_entity(entity: &str) -> Option<String> {
 pub struct Enricher {
     client: reqwest::Client,
     secrets: Secrets,
-    openreview_cache: HashMap<(String, i32), HashMap<String, String>>,
+    openreview_cache: HashMap<String, String>,
     doi_cache: HashMap<String, Option<String>>,
     openreview_login_token: OnceLock<String>,
 }
@@ -705,26 +705,31 @@ impl Enricher {
         let mut needed = Vec::new();
         let mut seen = HashSet::new();
         for paper in inputs {
-            if paper_source(paper) == Some(AbstractSource::Openreview) {
-                let key = (paper.venue.clone(), paper.year);
-                if !self.openreview_cache.contains_key(&key) && seen.insert(key.clone()) {
-                    needed.push(key);
-                }
+            let Some(id) = paper.url.as_deref().and_then(openreview_forum_id) else {
+                continue;
+            };
+            if !self.openreview_cache.contains_key(&id) && seen.insert(id.clone()) {
+                needed.push(id);
             }
         }
-        for key in needed {
-            match self.openreview_accepted_abstracts(&key.0, key.1).await {
-                Ok(abstracts) => {
-                    self.openreview_cache.insert(key, abstracts);
+        for ids in needed.chunks(OPENREVIEW_BATCH_SIZE) {
+            let mut missing = ids.to_vec();
+            for base in [
+                "https://api2.openreview.net/notes",
+                "https://api.openreview.net/notes",
+            ] {
+                match self.openreview_abstracts_from(base, &missing).await {
+                    Ok(abstracts) => self.openreview_cache.extend(abstracts),
+                    Err(e) => {
+                        eprintln!(
+                            "warning: OpenReview batch lookup failed for {base}: {}",
+                            terminal_safe(&e.to_string())
+                        );
+                    }
                 }
-                Err(e) => {
-                    let error = e.to_string();
-                    eprintln!(
-                        "warning: OpenReview batch lookup failed for {} {}: {}",
-                        terminal_safe(&key.0),
-                        key.1,
-                        terminal_safe(&error)
-                    );
+                missing.retain(|id| !self.openreview_cache.contains_key(id));
+                if missing.is_empty() {
+                    break;
                 }
             }
         }
@@ -944,11 +949,7 @@ impl Enricher {
     }
 
     async fn openreview_api_abstract(&self, paper: &Paper) -> Option<String> {
-        if paper_source(paper) != Some(AbstractSource::Openreview) {
-            return None;
-        }
-        let url = paper.url.as_deref()?;
-        let forum_id = openreview_forum_id(url)?;
+        let forum_id = openreview_forum_id(paper.url.as_deref()?)?;
         for base in [
             "https://api2.openreview.net/notes",
             "https://api.openreview.net/notes",
@@ -971,60 +972,25 @@ impl Enricher {
         None
     }
 
-    async fn openreview_accepted_abstracts(
-        &self,
-        venue: &str,
-        year: i32,
-    ) -> Result<HashMap<String, String>> {
-        let venue_id = format!("{venue}.cc/{year}/Conference");
-        let mut last_err = None;
-        for base in [
-            "https://api2.openreview.net/notes",
-            "https://api.openreview.net/notes",
-        ] {
-            match self
-                .openreview_accepted_abstracts_from(base, &venue_id)
-                .await
-            {
-                Ok(abstracts) if !abstracts.is_empty() => return Ok(abstracts),
-                Ok(_) => {}
-                Err(e) => last_err = Some(e),
-            }
-        }
-        match last_err {
-            Some(e) => Err(e),
-            None => Ok(HashMap::new()),
-        }
-    }
-
-    async fn openreview_accepted_abstracts_from(
+    async fn openreview_abstracts_from(
         &self,
         base: &str,
-        venue_id: &str,
+        ids: &[String],
     ) -> Result<HashMap<String, String>> {
-        let mut out = HashMap::new();
-        let mut offset = 0usize;
-        loop {
-            let req = self.openreview_get(base).await.query(&[
-                ("content.venueid", venue_id),
-                ("limit", &OPENREVIEW_PAGE_SIZE.to_string()),
-                ("offset", &offset.to_string()),
-            ]);
-            let json = self
-                .fetch_json(req, RateLimitRetry::Enabled)
-                .await
-                .map_err(crate::Error::Other)?;
-            let page_len = json
-                .get("notes")
-                .and_then(|v| v.as_array())
-                .map_or(0, Vec::len);
-            out.extend(abstracts_from_openreview_notes(&json));
-            if page_len < OPENREVIEW_PAGE_SIZE {
-                break;
-            }
-            offset += OPENREVIEW_PAGE_SIZE;
-        }
-        Ok(out)
+        let req = self.openreview_get(base).await.query(&[
+            ("ids", ids.join(",")),
+            ("limit", ids.len().to_string()),
+            ("select", "id,forum,content.abstract".to_string()),
+        ]);
+        let json = self
+            .fetch_json(req, RateLimitRetry::Enabled)
+            .await
+            .map_err(crate::Error::Other)?;
+        let mut abstracts = abstracts_from_openreview_notes(&json);
+        Ok(ids
+            .iter()
+            .filter_map(|id| abstracts.remove_entry(id))
+            .collect())
     }
 
     async fn openreview_get(&self, url: &str) -> reqwest::RequestBuilder {
@@ -1297,16 +1263,9 @@ fn paper_source(paper: &Paper) -> Option<AbstractSource> {
     paper.url.as_deref().and_then(source_from_paper_url)
 }
 
-fn cached_openreview_abstract(
-    cache: &HashMap<(String, i32), HashMap<String, String>>,
-    paper: &Paper,
-) -> Option<String> {
-    if paper_source(paper) != Some(AbstractSource::Openreview) {
-        return None;
-    }
+fn cached_openreview_abstract(cache: &HashMap<String, String>, paper: &Paper) -> Option<String> {
     let forum_id = openreview_forum_id(paper.url.as_deref()?)?;
     cache
-        .get(&(paper.venue.clone(), paper.year))?
         .get(&forum_id)
         .cloned()
         .and_then(|abs| usable_abstract_for_title(abs, &paper.title))
@@ -1839,14 +1798,87 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn openreview_batch_requests_exact_ids_across_tracks_and_api_versions() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let ids = [
+            "conference",
+            "workshop",
+            "later-api1",
+            "modern-api2",
+            "missing",
+        ]
+        .map(str::to_string);
+        let abstract_for = |id| fixture_abstract(&format!("Exact {id} abstract."));
+        let body = json!({"notes": [
+            {"id": "workshop", "content": {"abstract": abstract_for("workshop")}},
+            {"id": "modern-api2", "content": {"abstract": {"value": abstract_for("modern-api2")}}},
+            {"id": "unrequested", "content": {"abstract": "Unrelated abstract."}},
+            {"id": "later-api1", "content": {"abstract": abstract_for("later-api1")}},
+            {"id": "conference", "content": {"abstract": abstract_for("conference")}}
+        ]})
+        .to_string();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/notes", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                request.push_str(&line);
+            }
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            request
+        });
+
+        let abstracts = Enricher::new(Secrets::default())
+            .openreview_abstracts_from(&base, &ids)
+            .await
+            .unwrap();
+        let request = server.join().unwrap();
+        let target = request
+            .lines()
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap();
+        let url = Url::parse(&base).unwrap().join(target).unwrap();
+        assert_eq!(
+            url.query_pairs().into_owned().collect::<HashMap<_, _>>(),
+            HashMap::from([
+                ("ids".into(), ids.join(",")),
+                ("limit".into(), "5".into()),
+                ("select".into(), "id,forum,content.abstract".into()),
+            ])
+        );
+        assert_eq!(abstracts.len(), 4);
+        for id in &ids[..4] {
+            assert_eq!(abstracts.get(id), Some(&abstract_for(id)));
+        }
+        assert!(!abstracts.contains_key("missing"));
+        assert!(!abstracts.contains_key("unrequested"));
+    }
+
     #[test]
     fn cached_openreview_abstract_uses_forum_id() {
         let abs = fixture_abstract("Cached abstract.");
         let mut cache = HashMap::new();
-        cache.insert(
-            ("ICLR".to_string(), 2024),
-            HashMap::from([("Oxh5CstDJU".to_string(), abs.clone())]),
-        );
+        cache.insert("Oxh5CstDJU".to_string(), abs.clone());
         assert_eq!(
             cached_openreview_abstract(
                 &cache,
@@ -1864,10 +1896,9 @@ mod tests {
     async fn enrich_many_uses_cached_openreview_abstracts() {
         let abs = fixture_abstract("Cached abstract.");
         let mut enricher = Enricher::new(Secrets::default());
-        enricher.openreview_cache.insert(
-            ("ICLR".to_string(), 2024),
-            HashMap::from([("Oxh5CstDJU".to_string(), abs.clone())]),
-        );
+        enricher
+            .openreview_cache
+            .insert("Oxh5CstDJU".to_string(), abs.clone());
 
         let results = enricher
             .enrich_many(
