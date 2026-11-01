@@ -698,20 +698,11 @@ impl Enricher {
         let doi_cache = &self.doi_cache;
         let enricher = &*self;
         stream::iter(inputs.into_iter().map(|paper| async move {
-            let doi_prefetch_complete = paper
-                .doi
-                .as_deref()
-                .and_then(normalized_doi)
-                .is_some_and(|doi| doi_cache.contains_key(&doi));
             let result = match cached_doi_abstract(doi_cache, &paper)
                 .or_else(|| cached_openreview_abstract(openreview_cache, &paper))
             {
                 Some(abs) => Ok(EnrichResult::Found(abs)),
-                None => {
-                    enricher
-                        .enrich_after_prefetch(&paper, doi_prefetch_complete)
-                        .await
-                }
+                None => enricher.enrich_after_prefetch(&paper).await,
             };
             (paper, result)
         }))
@@ -810,15 +801,9 @@ impl Enricher {
         }
     }
 
-    async fn enrich_after_prefetch(
-        &self,
-        paper: &Paper,
-        doi_prefetch_complete: bool,
-    ) -> Result<EnrichResult> {
-        if !doi_prefetch_complete {
-            if let Some(abs) = self.api_by_doi(paper).await? {
-                return Ok(EnrichResult::Found(abs));
-            }
+    async fn enrich_after_prefetch(&self, paper: &Paper) -> Result<EnrichResult> {
+        if let Some(abs) = self.api_by_doi(paper).await? {
+            return Ok(EnrichResult::Found(abs));
         }
         if let Some(abs) = self.openreview_api_abstract(paper).await {
             return Ok(EnrichResult::Found(abs));
@@ -859,29 +844,31 @@ impl Enricher {
         let Some(doi) = paper.doi.as_deref().and_then(normalized_doi) else {
             return Ok(None);
         };
-        let s2 = format!(
-            "https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}?fields=title,abstract"
-        );
-        if let Some(abs) = self
-            .fetch_semantic_scholar_json(self.client.get(&s2))
-            .await
-            .ok()
-            .filter(|json| json_doi_title_matches(json, &paper.title))
-            .and_then(|json| abstract_from_semantic_scholar(&json))
-            .and_then(|abs| usable_abstract_for_title(abs, &paper.title))
-        {
-            return Ok(Some(abs));
-        }
+        if !self.doi_cache.contains_key(&doi) {
+            let s2 = format!(
+                "https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}?fields=title,abstract"
+            );
+            if let Some(abs) = self
+                .fetch_semantic_scholar_json(self.client.get(&s2))
+                .await
+                .ok()
+                .filter(|json| json_doi_title_matches(json, &paper.title))
+                .and_then(|json| abstract_from_semantic_scholar(&json))
+                .and_then(|abs| usable_abstract_for_title(abs, &paper.title))
+            {
+                return Ok(Some(abs));
+            }
 
-        if let Some(abs) = self
-            .fetch_openalex_json(&format!("https://api.openalex.org/works/doi:{doi}"), &[])
-            .await
-            .ok()
-            .filter(|json| json_doi_title_matches(json, &paper.title))
-            .and_then(|json| abstract_from_openalex(&json))
-            .and_then(|abs| usable_abstract_for_title(abs, &paper.title))
-        {
-            return Ok(Some(abs));
+            if let Some(abs) = self
+                .fetch_openalex_json(&format!("https://api.openalex.org/works/doi:{doi}"), &[])
+                .await
+                .ok()
+                .filter(|json| json_doi_title_matches(json, &paper.title))
+                .and_then(|json| abstract_from_openalex(&json))
+                .and_then(|abs| usable_abstract_for_title(abs, &paper.title))
+            {
+                return Ok(Some(abs));
+            }
         }
 
         let cr = self
@@ -2053,6 +2040,65 @@ mod tests {
             source_from_paper_url("https://doi.org/10.24963/ijcai.2024/1"),
             Some(AbstractSource::Ijcai)
         );
+    }
+
+    #[tokio::test]
+    async fn cached_doi_miss_still_tries_crossref() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut enricher = Enricher::new(Secrets::default());
+        enricher.client = reqwest::Client::builder()
+            .proxy(
+                reqwest::Proxy::all(format!("http://{}", listener.local_addr().unwrap())).unwrap(),
+            )
+            .build()
+            .unwrap();
+        let mut paper = paper("Expected Title");
+        paper.doi = Some("10.24963/IJCAI.2026/476".into());
+        paper.url = None;
+        enricher
+            .doi_cache
+            .insert(normalized_doi(paper.doi.as_deref().unwrap()).unwrap(), None);
+
+        let mut requests = Vec::new();
+        let proxy = async {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(&mut socket);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                requests.push(line.trim_end().to_owned());
+                loop {
+                    line.clear();
+                    assert!(reader.read_line(&mut line).await.unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                socket.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            }
+        };
+        let results = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                results = enricher.enrich_many(vec![paper], 1) => results,
+                _ = proxy => unreachable!("proxy runs until enrichment finishes"),
+            }
+        })
+        .await
+        .expect("local proxy and enrichment must finish");
+
+        assert!(
+            !requests.is_empty(),
+            "a batch miss must still reach Crossref"
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| request == "CONNECT api.crossref.org:443 HTTP/1.1"),
+            "unexpected requests: {requests:?}"
+        );
+        assert!(matches!(&results[0].1, Ok(EnrichResult::Missing(_))));
     }
 
     #[test]
