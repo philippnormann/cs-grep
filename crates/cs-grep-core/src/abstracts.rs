@@ -343,7 +343,14 @@ fn abstract_candidates(html: &str, source: Option<AbstractSource>) -> Vec<String
         Some(AbstractSource::Cvf) => selector_texts(&doc, &["div#abstract"]),
         Some(AbstractSource::Ieee) => selector_texts(&doc, &["div.abstract-text"]),
         Some(AbstractSource::Ijcai) => {
-            selector_texts(&doc, &[".proceedings-detail hr + .row > .col-md-12"])
+            let text = selector_texts(&doc, &[".article__abstract > p:not(.eyebrow)"]).join(" ");
+            non_empty_text(text)
+                .into_iter()
+                .chain(selector_texts(
+                    &doc,
+                    &[".proceedings-detail hr + .row > .col-md-12"],
+                ))
+                .collect()
         }
         Some(AbstractSource::Ndss) => extract_ndss_abstract(&doc).into_iter().collect(),
         Some(AbstractSource::Iclr | AbstractSource::Neurips) => {
@@ -2121,6 +2128,26 @@ mod tests {
         assert_eq!(
             extract_abstract_html(html, Some(AbstractSource::Ijcai)).as_deref(),
             Some("This is the IJCAI abstract.")
+        );
+    }
+
+    #[test]
+    fn html_ijcai_article_uses_full_abstract_without_heading() {
+        let html = r#"<html><head>
+            <meta name="description" content="Truncated abstract...">
+        </head><body>
+            <p>Navigation text</p>
+            <div class="article__abstract">
+                <p class="eyebrow">Abstract</p>
+                <p>We study <em>temporal graphs</em> and introduce an adaptive sampling
+                method.</p><p>Experiments on several benchmarks show improved prediction
+                accuracy while reducing the computational cost.</p>
+            </div>
+            <p>Keywords: graphs</p>
+        </body></html>"#;
+        assert_eq!(
+            extract_abstract_html(html, Some(AbstractSource::Ijcai)).as_deref(),
+            Some("We study temporal graphs and introduce an adaptive sampling method. Experiments on several benchmarks show improved prediction accuracy while reducing the computational cost.")
         );
     }
 
