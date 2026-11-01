@@ -42,6 +42,7 @@ enum AbstractSource {
     Acl,
     Acm,
     Cvf,
+    Iclr,
     Ieee,
     Ijcai,
     Ndss,
@@ -345,7 +346,9 @@ fn abstract_candidates(html: &str, source: Option<AbstractSource>) -> Vec<String
             selector_texts(&doc, &[".proceedings-detail hr + .row > .col-md-12"])
         }
         Some(AbstractSource::Ndss) => extract_ndss_abstract(&doc).into_iter().collect(),
-        Some(AbstractSource::Neurips) => extract_neurips_abstract(&doc).into_iter().collect(),
+        Some(AbstractSource::Iclr | AbstractSource::Neurips) => {
+            extract_neurips_abstract(&doc).into_iter().collect()
+        }
         Some(AbstractSource::Openreview) => selector_texts(&doc, &[".abstract-text-inner"]),
         Some(AbstractSource::Pmlr) => selector_texts(&doc, &["div#abstract"]),
         Some(AbstractSource::Springer) => selector_texts(
@@ -1191,6 +1194,7 @@ fn source_from_static_url(url: &Url) -> Option<AbstractSource> {
         "doi.ieeecomputersociety.org" | "ieeexplore.ieee.org" => Some(AbstractSource::Ieee),
         "ijcai.org" | "www.ijcai.org" => Some(AbstractSource::Ijcai),
         "openaccess.thecvf.com" => Some(AbstractSource::Cvf),
+        "proceedings.iclr.cc" => Some(AbstractSource::Iclr),
         "openreview.net" | "www.openreview.net" => Some(AbstractSource::Openreview),
         "proceedings.mlr.press" => Some(AbstractSource::Pmlr),
         "neurips.cc"
@@ -2150,6 +2154,38 @@ mod tests {
             extract_abstract_html(html, Some(AbstractSource::Usenix)).as_deref(),
             Some("This is the USENIX abstract.")
         );
+    }
+
+    #[test]
+    fn html_iclr_proceedings_uses_full_primary_abstract() {
+        let mut paper = paper("A proceedings paper");
+        paper.url = Some(
+            "https://proceedings.iclr.cc/paper_files/paper/2026/hash/example-Abstract-Conference.html"
+                .into(),
+        );
+        let url = static_fetch_url(paper.url.as_deref().unwrap()).unwrap();
+        let html = r#"<html><head>
+            <meta name="citation_title" content="A proceedings paper">
+            <meta name="description" content="Truncated abstract...">
+        </head><body>
+            <p>Navigation text</p>
+            <section class="paper-section">
+                <h2 class="section-label">Abstract</h2>
+                <p class="paper-abstract">We study <em>private streams</em> and give an
+                efficient algorithm with improved accuracy. Our analysis establishes
+                bounds on both the error and the required space.</p>
+            </section>
+        </body></html>"#;
+        assert!(static_page_title_matches(html, &paper));
+        assert!(paper_source(&paper).is_some());
+        let abstract_text = abstract_candidates(html, source_from_static_url(&url))
+            .into_iter()
+            .find_map(|abs| usable_abstract_for_title(abs, &paper.title));
+        assert_eq!(
+            abstract_text.as_deref(),
+            Some("We study private streams and give an efficient algorithm with improved accuracy. Our analysis establishes bounds on both the error and the required space.")
+        );
+        assert!(static_fetch_url("https://proceedings.iclr.cc.attacker.example/paper").is_none());
     }
 
     #[test]
