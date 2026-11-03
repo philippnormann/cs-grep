@@ -27,8 +27,10 @@ const MAX_JSON_BODY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_HTML_BODY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_STATIC_REDIRECTS: usize = 5;
 const MAX_RATE_LIMIT_SLEEP: Duration = Duration::from_secs(65);
-const OPENREVIEW_PAGE_SIZE: usize = 500;
+const OPENREVIEW_BATCH_SIZE: usize = 500;
 const OPENREVIEW_LOGIN_EXPIRES_IN: u64 = 7 * 24 * 60 * 60;
+const OPENREVIEW_API_V1: usize = 0;
+const OPENREVIEW_API_V2: usize = 1;
 const SEMANTIC_SCHOLAR_BATCH_SIZE: usize = 500;
 const OPENALEX_BATCH_SIZE: usize = 100;
 const TRANSIENT_RETRY_DELAY: Duration = Duration::from_millis(250);
@@ -40,6 +42,7 @@ enum AbstractSource {
     Acl,
     Acm,
     Cvf,
+    Iclr,
     Ieee,
     Ijcai,
     Ndss,
@@ -340,10 +343,19 @@ fn abstract_candidates(html: &str, source: Option<AbstractSource>) -> Vec<String
         Some(AbstractSource::Cvf) => selector_texts(&doc, &["div#abstract"]),
         Some(AbstractSource::Ieee) => selector_texts(&doc, &["div.abstract-text"]),
         Some(AbstractSource::Ijcai) => {
-            selector_texts(&doc, &[".proceedings-detail hr + .row > .col-md-12"])
+            let text = selector_texts(&doc, &[".article__abstract > p:not(.eyebrow)"]).join(" ");
+            non_empty_text(text)
+                .into_iter()
+                .chain(selector_texts(
+                    &doc,
+                    &[".proceedings-detail hr + .row > .col-md-12"],
+                ))
+                .collect()
         }
         Some(AbstractSource::Ndss) => extract_ndss_abstract(&doc).into_iter().collect(),
-        Some(AbstractSource::Neurips) => extract_neurips_abstract(&doc).into_iter().collect(),
+        Some(AbstractSource::Iclr | AbstractSource::Neurips) => {
+            extract_neurips_abstract(&doc).into_iter().collect()
+        }
         Some(AbstractSource::Openreview) => selector_texts(&doc, &[".abstract-text-inner"]),
         Some(AbstractSource::Pmlr) => selector_texts(&doc, &["div#abstract"]),
         Some(AbstractSource::Springer) => selector_texts(
@@ -619,9 +631,9 @@ fn decode_entity(entity: &str) -> Option<String> {
 pub struct Enricher {
     client: reqwest::Client,
     secrets: Secrets,
-    openreview_cache: HashMap<(String, i32), HashMap<String, String>>,
+    openreview_cache: HashMap<String, String>,
     doi_cache: HashMap<String, Option<String>>,
-    openreview_login_token: OnceLock<String>,
+    openreview_login_tokens: [OnceLock<String>; 2],
 }
 
 pub enum EnrichResult {
@@ -650,6 +662,14 @@ fn store_doi_batch_results(
     }
 }
 
+fn openreview_auth_target(url: &str) -> Option<(usize, &'static str)> {
+    if url.starts_with("https://api2.openreview.net/") {
+        return Some((OPENREVIEW_API_V2, "https://api2.openreview.net/login"));
+    }
+    url.starts_with("https://api.openreview.net/")
+        .then_some((OPENREVIEW_API_V1, "https://api.openreview.net/login"))
+}
+
 impl Enricher {
     pub fn new(secrets: Secrets) -> Self {
         let client = reqwest::Client::builder()
@@ -664,7 +684,7 @@ impl Enricher {
             secrets,
             openreview_cache: HashMap::new(),
             doi_cache: HashMap::new(),
-            openreview_login_token: OnceLock::new(),
+            openreview_login_tokens: [OnceLock::new(), OnceLock::new()],
         }
     }
 
@@ -678,20 +698,11 @@ impl Enricher {
         let doi_cache = &self.doi_cache;
         let enricher = &*self;
         stream::iter(inputs.into_iter().map(|paper| async move {
-            let doi_prefetch_complete = paper
-                .doi
-                .as_deref()
-                .and_then(normalized_doi)
-                .is_some_and(|doi| doi_cache.contains_key(&doi));
             let result = match cached_doi_abstract(doi_cache, &paper)
                 .or_else(|| cached_openreview_abstract(openreview_cache, &paper))
             {
                 Some(abs) => Ok(EnrichResult::Found(abs)),
-                None => {
-                    enricher
-                        .enrich_after_prefetch(&paper, doi_prefetch_complete)
-                        .await
-                }
+                None => enricher.enrich_after_prefetch(&paper).await,
             };
             (paper, result)
         }))
@@ -705,26 +716,31 @@ impl Enricher {
         let mut needed = Vec::new();
         let mut seen = HashSet::new();
         for paper in inputs {
-            if paper_source(paper) == Some(AbstractSource::Openreview) {
-                let key = (paper.venue.clone(), paper.year);
-                if !self.openreview_cache.contains_key(&key) && seen.insert(key.clone()) {
-                    needed.push(key);
-                }
+            let Some(id) = paper.url.as_deref().and_then(openreview_forum_id) else {
+                continue;
+            };
+            if !self.openreview_cache.contains_key(&id) && seen.insert(id.clone()) {
+                needed.push(id);
             }
         }
-        for key in needed {
-            match self.openreview_accepted_abstracts(&key.0, key.1).await {
-                Ok(abstracts) => {
-                    self.openreview_cache.insert(key, abstracts);
+        for ids in needed.chunks(OPENREVIEW_BATCH_SIZE) {
+            let mut missing = ids.to_vec();
+            for base in [
+                "https://api2.openreview.net/notes",
+                "https://api.openreview.net/notes",
+            ] {
+                match self.openreview_abstracts_from(base, &missing).await {
+                    Ok(abstracts) => self.openreview_cache.extend(abstracts),
+                    Err(e) => {
+                        eprintln!(
+                            "warning: OpenReview batch lookup failed for {base}: {}",
+                            terminal_safe(&e.to_string())
+                        );
+                    }
                 }
-                Err(e) => {
-                    let error = e.to_string();
-                    eprintln!(
-                        "warning: OpenReview batch lookup failed for {} {}: {}",
-                        terminal_safe(&key.0),
-                        key.1,
-                        terminal_safe(&error)
-                    );
+                missing.retain(|id| !self.openreview_cache.contains_key(id));
+                if missing.is_empty() {
+                    break;
                 }
             }
         }
@@ -785,15 +801,9 @@ impl Enricher {
         }
     }
 
-    async fn enrich_after_prefetch(
-        &self,
-        paper: &Paper,
-        doi_prefetch_complete: bool,
-    ) -> Result<EnrichResult> {
-        if !doi_prefetch_complete {
-            if let Some(abs) = self.api_by_doi(paper).await? {
-                return Ok(EnrichResult::Found(abs));
-            }
+    async fn enrich_after_prefetch(&self, paper: &Paper) -> Result<EnrichResult> {
+        if let Some(abs) = self.api_by_doi(paper).await? {
+            return Ok(EnrichResult::Found(abs));
         }
         if let Some(abs) = self.openreview_api_abstract(paper).await {
             return Ok(EnrichResult::Found(abs));
@@ -834,29 +844,31 @@ impl Enricher {
         let Some(doi) = paper.doi.as_deref().and_then(normalized_doi) else {
             return Ok(None);
         };
-        let s2 = format!(
-            "https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}?fields=title,abstract"
-        );
-        if let Some(abs) = self
-            .fetch_semantic_scholar_json(self.client.get(&s2))
-            .await
-            .ok()
-            .filter(|json| json_doi_title_matches(json, &paper.title))
-            .and_then(|json| abstract_from_semantic_scholar(&json))
-            .and_then(|abs| usable_abstract_for_title(abs, &paper.title))
-        {
-            return Ok(Some(abs));
-        }
+        if !self.doi_cache.contains_key(&doi) {
+            let s2 = format!(
+                "https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}?fields=title,abstract"
+            );
+            if let Some(abs) = self
+                .fetch_semantic_scholar_json(self.client.get(&s2))
+                .await
+                .ok()
+                .filter(|json| json_doi_title_matches(json, &paper.title))
+                .and_then(|json| abstract_from_semantic_scholar(&json))
+                .and_then(|abs| usable_abstract_for_title(abs, &paper.title))
+            {
+                return Ok(Some(abs));
+            }
 
-        if let Some(abs) = self
-            .fetch_openalex_json(&format!("https://api.openalex.org/works/doi:{doi}"), &[])
-            .await
-            .ok()
-            .filter(|json| json_doi_title_matches(json, &paper.title))
-            .and_then(|json| abstract_from_openalex(&json))
-            .and_then(|abs| usable_abstract_for_title(abs, &paper.title))
-        {
-            return Ok(Some(abs));
+            if let Some(abs) = self
+                .fetch_openalex_json(&format!("https://api.openalex.org/works/doi:{doi}"), &[])
+                .await
+                .ok()
+                .filter(|json| json_doi_title_matches(json, &paper.title))
+                .and_then(|json| abstract_from_openalex(&json))
+                .and_then(|abs| usable_abstract_for_title(abs, &paper.title))
+            {
+                return Ok(Some(abs));
+            }
         }
 
         let cr = self
@@ -944,11 +956,7 @@ impl Enricher {
     }
 
     async fn openreview_api_abstract(&self, paper: &Paper) -> Option<String> {
-        if paper_source(paper) != Some(AbstractSource::Openreview) {
-            return None;
-        }
-        let url = paper.url.as_deref()?;
-        let forum_id = openreview_forum_id(url)?;
+        let forum_id = openreview_forum_id(paper.url.as_deref()?)?;
         for base in [
             "https://api2.openreview.net/notes",
             "https://api.openreview.net/notes",
@@ -971,94 +979,58 @@ impl Enricher {
         None
     }
 
-    async fn openreview_accepted_abstracts(
-        &self,
-        venue: &str,
-        year: i32,
-    ) -> Result<HashMap<String, String>> {
-        let venue_id = format!("{venue}.cc/{year}/Conference");
-        let mut last_err = None;
-        for base in [
-            "https://api2.openreview.net/notes",
-            "https://api.openreview.net/notes",
-        ] {
-            match self
-                .openreview_accepted_abstracts_from(base, &venue_id)
-                .await
-            {
-                Ok(abstracts) if !abstracts.is_empty() => return Ok(abstracts),
-                Ok(_) => {}
-                Err(e) => last_err = Some(e),
-            }
-        }
-        match last_err {
-            Some(e) => Err(e),
-            None => Ok(HashMap::new()),
-        }
-    }
-
-    async fn openreview_accepted_abstracts_from(
+    async fn openreview_abstracts_from(
         &self,
         base: &str,
-        venue_id: &str,
+        ids: &[String],
     ) -> Result<HashMap<String, String>> {
-        let mut out = HashMap::new();
-        let mut offset = 0usize;
-        loop {
-            let req = self.openreview_get(base).await.query(&[
-                ("content.venueid", venue_id),
-                ("limit", &OPENREVIEW_PAGE_SIZE.to_string()),
-                ("offset", &offset.to_string()),
-            ]);
-            let json = self
-                .fetch_json(req, RateLimitRetry::Enabled)
-                .await
-                .map_err(crate::Error::Other)?;
-            let page_len = json
-                .get("notes")
-                .and_then(|v| v.as_array())
-                .map_or(0, Vec::len);
-            out.extend(abstracts_from_openreview_notes(&json));
-            if page_len < OPENREVIEW_PAGE_SIZE {
-                break;
-            }
-            offset += OPENREVIEW_PAGE_SIZE;
-        }
-        Ok(out)
+        let req = self.openreview_get(base).await.query(&[
+            ("ids", ids.join(",")),
+            ("limit", ids.len().to_string()),
+            ("select", "id,forum,content.abstract".to_string()),
+        ]);
+        let json = self
+            .fetch_json(req, RateLimitRetry::Enabled)
+            .await
+            .map_err(crate::Error::Other)?;
+        let mut abstracts = abstracts_from_openreview_notes(&json);
+        Ok(ids
+            .iter()
+            .filter_map(|id| abstracts.remove_entry(id))
+            .collect())
     }
 
     async fn openreview_get(&self, url: &str) -> reqwest::RequestBuilder {
         let req = self.client.get(url);
-        if url.contains("api2.openreview.net") {
-            if let Some(token) = self.openreview_login_token().await {
-                return req.header(header::AUTHORIZATION, format!("Bearer {token}"));
-            }
+        let Some((api, login_url)) = openreview_auth_target(url) else {
+            return req;
+        };
+        if let Some(token) = self.openreview_login_token(api, login_url).await {
+            return req.header(header::AUTHORIZATION, format!("Bearer {token}"));
         }
         req
     }
 
-    async fn openreview_login_token(&self) -> Option<String> {
-        if let Some(token) = self.openreview_login_token.get() {
+    async fn openreview_login_token(&self, api: usize, login_url: &str) -> Option<String> {
+        let token_cache = &self.openreview_login_tokens[api];
+        if let Some(token) = token_cache.get() {
             return Some(token.clone());
         }
-        let token = self.openreview_login().await;
+        let token = self.openreview_login(login_url).await;
         if let Some(token) = &token {
-            let _ = self.openreview_login_token.set(token.clone());
+            let _ = token_cache.set(token.clone());
         }
         token
     }
 
-    async fn openreview_login(&self) -> Option<String> {
+    async fn openreview_login(&self, login_url: &str) -> Option<String> {
         let username = self.secrets.openreview_username.as_deref()?;
         let password = self.secrets.openreview_password.as_deref()?;
-        let req = self
-            .client
-            .post("https://api2.openreview.net/login")
-            .json(&serde_json::json!({
-                "id": username,
-                "password": password,
-                "expiresIn": OPENREVIEW_LOGIN_EXPIRES_IN,
-            }));
+        let req = self.client.post(login_url).json(&serde_json::json!({
+            "id": username,
+            "password": password,
+            "expiresIn": OPENREVIEW_LOGIN_EXPIRES_IN,
+        }));
         let json = self.fetch_json(req, RateLimitRetry::Disabled).await.ok()?;
         json.get("token")
             .and_then(|token| token.as_str())
@@ -1216,6 +1188,7 @@ fn source_from_static_url(url: &Url) -> Option<AbstractSource> {
         "doi.ieeecomputersociety.org" | "ieeexplore.ieee.org" => Some(AbstractSource::Ieee),
         "ijcai.org" | "www.ijcai.org" => Some(AbstractSource::Ijcai),
         "openaccess.thecvf.com" => Some(AbstractSource::Cvf),
+        "proceedings.iclr.cc" => Some(AbstractSource::Iclr),
         "openreview.net" | "www.openreview.net" => Some(AbstractSource::Openreview),
         "proceedings.mlr.press" => Some(AbstractSource::Pmlr),
         "neurips.cc"
@@ -1297,16 +1270,9 @@ fn paper_source(paper: &Paper) -> Option<AbstractSource> {
     paper.url.as_deref().and_then(source_from_paper_url)
 }
 
-fn cached_openreview_abstract(
-    cache: &HashMap<(String, i32), HashMap<String, String>>,
-    paper: &Paper,
-) -> Option<String> {
-    if paper_source(paper) != Some(AbstractSource::Openreview) {
-        return None;
-    }
+fn cached_openreview_abstract(cache: &HashMap<String, String>, paper: &Paper) -> Option<String> {
     let forum_id = openreview_forum_id(paper.url.as_deref()?)?;
     cache
-        .get(&(paper.venue.clone(), paper.year))?
         .get(&forum_id)
         .cloned()
         .and_then(|abs| usable_abstract_for_title(abs, &paper.title))
@@ -1502,6 +1468,58 @@ mod tests {
 
     fn extract_abstract_html(html: &str, source: Option<AbstractSource>) -> Option<String> {
         abstract_candidates(html, source).into_iter().next()
+    }
+
+    #[test]
+    fn openreview_auth_routes_both_api_versions() {
+        assert_eq!(
+            openreview_auth_target("https://api2.openreview.net/notes"),
+            Some((OPENREVIEW_API_V2, "https://api2.openreview.net/login"))
+        );
+        assert_eq!(
+            openreview_auth_target("https://api.openreview.net/notes"),
+            Some((OPENREVIEW_API_V1, "https://api.openreview.net/login"))
+        );
+        assert_eq!(
+            openreview_auth_target("https://api.openreview.net.evil/notes"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn openreview_requests_keep_tokens_scoped_to_each_api() {
+        let enricher = Enricher::new(Secrets::default());
+        enricher.openreview_login_tokens[OPENREVIEW_API_V1]
+            .set("api1-token".into())
+            .unwrap();
+        enricher.openreview_login_tokens[OPENREVIEW_API_V2]
+            .set("api2-token".into())
+            .unwrap();
+        for (url, expected) in [
+            (
+                "https://api.openreview.net/notes",
+                Some("Bearer api1-token"),
+            ),
+            (
+                "https://api2.openreview.net/notes",
+                Some("Bearer api2-token"),
+            ),
+            ("https://api.openreview.net.example/notes", None),
+            ("https://api2.openreview.net.example/notes", None),
+            ("https://example.com/api2.openreview.net/notes", None),
+            ("http://api.openreview.net/notes", None),
+            ("http://api2.openreview.net/notes", None),
+        ] {
+            let request = enricher.openreview_get(url).await.build().unwrap();
+            assert_eq!(
+                request
+                    .headers()
+                    .get(header::AUTHORIZATION)
+                    .map(|h| h.to_str().unwrap()),
+                expected,
+                "{url}"
+            );
+        }
     }
 
     #[test]
@@ -1839,14 +1857,87 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn openreview_batch_requests_exact_ids_across_tracks_and_api_versions() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let ids = [
+            "conference",
+            "workshop",
+            "later-api1",
+            "modern-api2",
+            "missing",
+        ]
+        .map(str::to_string);
+        let abstract_for = |id| fixture_abstract(&format!("Exact {id} abstract."));
+        let body = json!({"notes": [
+            {"id": "workshop", "content": {"abstract": abstract_for("workshop")}},
+            {"id": "modern-api2", "content": {"abstract": {"value": abstract_for("modern-api2")}}},
+            {"id": "unrequested", "content": {"abstract": "Unrelated abstract."}},
+            {"id": "later-api1", "content": {"abstract": abstract_for("later-api1")}},
+            {"id": "conference", "content": {"abstract": abstract_for("conference")}}
+        ]})
+        .to_string();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/notes", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                request.push_str(&line);
+            }
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            request
+        });
+
+        let abstracts = Enricher::new(Secrets::default())
+            .openreview_abstracts_from(&base, &ids)
+            .await
+            .unwrap();
+        let request = server.join().unwrap();
+        let target = request
+            .lines()
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap();
+        let url = Url::parse(&base).unwrap().join(target).unwrap();
+        assert_eq!(
+            url.query_pairs().into_owned().collect::<HashMap<_, _>>(),
+            HashMap::from([
+                ("ids".into(), ids.join(",")),
+                ("limit".into(), "5".into()),
+                ("select".into(), "id,forum,content.abstract".into()),
+            ])
+        );
+        assert_eq!(abstracts.len(), 4);
+        for id in &ids[..4] {
+            assert_eq!(abstracts.get(id), Some(&abstract_for(id)));
+        }
+        assert!(!abstracts.contains_key("missing"));
+        assert!(!abstracts.contains_key("unrequested"));
+    }
+
     #[test]
     fn cached_openreview_abstract_uses_forum_id() {
         let abs = fixture_abstract("Cached abstract.");
         let mut cache = HashMap::new();
-        cache.insert(
-            ("ICLR".to_string(), 2024),
-            HashMap::from([("Oxh5CstDJU".to_string(), abs.clone())]),
-        );
+        cache.insert("Oxh5CstDJU".to_string(), abs.clone());
         assert_eq!(
             cached_openreview_abstract(
                 &cache,
@@ -1864,10 +1955,9 @@ mod tests {
     async fn enrich_many_uses_cached_openreview_abstracts() {
         let abs = fixture_abstract("Cached abstract.");
         let mut enricher = Enricher::new(Secrets::default());
-        enricher.openreview_cache.insert(
-            ("ICLR".to_string(), 2024),
-            HashMap::from([("Oxh5CstDJU".to_string(), abs.clone())]),
-        );
+        enricher
+            .openreview_cache
+            .insert("Oxh5CstDJU".to_string(), abs.clone());
 
         let results = enricher
             .enrich_many(
@@ -1952,6 +2042,65 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn cached_doi_miss_still_tries_crossref() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut enricher = Enricher::new(Secrets::default());
+        enricher.client = reqwest::Client::builder()
+            .proxy(
+                reqwest::Proxy::all(format!("http://{}", listener.local_addr().unwrap())).unwrap(),
+            )
+            .build()
+            .unwrap();
+        let mut paper = paper("Expected Title");
+        paper.doi = Some("10.24963/IJCAI.2026/476".into());
+        paper.url = None;
+        enricher
+            .doi_cache
+            .insert(normalized_doi(paper.doi.as_deref().unwrap()).unwrap(), None);
+
+        let mut requests = Vec::new();
+        let proxy = async {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(&mut socket);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                requests.push(line.trim_end().to_owned());
+                loop {
+                    line.clear();
+                    assert!(reader.read_line(&mut line).await.unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                socket.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            }
+        };
+        let results = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                results = enricher.enrich_many(vec![paper], 1) => results,
+                _ = proxy => unreachable!("proxy runs until enrichment finishes"),
+            }
+        })
+        .await
+        .expect("local proxy and enrichment must finish");
+
+        assert!(
+            !requests.is_empty(),
+            "a batch miss must still reach Crossref"
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| request == "CONNECT api.crossref.org:443 HTTP/1.1"),
+            "unexpected requests: {requests:?}"
+        );
+        assert!(matches!(&results[0].1, Ok(EnrichResult::Missing(_))));
+    }
+
     #[test]
     fn crossref_strips_jats() {
         let msg = json!({"abstract": "<jats:p>A <jats:bold>bold</jats:bold> claim.</jats:p>"});
@@ -2029,6 +2178,26 @@ mod tests {
     }
 
     #[test]
+    fn html_ijcai_article_uses_full_abstract_without_heading() {
+        let html = r#"<html><head>
+            <meta name="description" content="Truncated abstract...">
+        </head><body>
+            <p>Navigation text</p>
+            <div class="article__abstract">
+                <p class="eyebrow">Abstract</p>
+                <p>We study <em>temporal graphs</em> and introduce an adaptive sampling
+                method.</p><p>Experiments on several benchmarks show improved prediction
+                accuracy while reducing the computational cost.</p>
+            </div>
+            <p>Keywords: graphs</p>
+        </body></html>"#;
+        assert_eq!(
+            extract_abstract_html(html, Some(AbstractSource::Ijcai)).as_deref(),
+            Some("We study temporal graphs and introduce an adaptive sampling method. Experiments on several benchmarks show improved prediction accuracy while reducing the computational cost.")
+        );
+    }
+
+    #[test]
     fn html_ndss_strips_authors_from_paper_data() {
         let html = r#"<html><body>
             <div class="paper-data">
@@ -2058,6 +2227,38 @@ mod tests {
             extract_abstract_html(html, Some(AbstractSource::Usenix)).as_deref(),
             Some("This is the USENIX abstract.")
         );
+    }
+
+    #[test]
+    fn html_iclr_proceedings_uses_full_primary_abstract() {
+        let mut paper = paper("A proceedings paper");
+        paper.url = Some(
+            "https://proceedings.iclr.cc/paper_files/paper/2026/hash/example-Abstract-Conference.html"
+                .into(),
+        );
+        let url = static_fetch_url(paper.url.as_deref().unwrap()).unwrap();
+        let html = r#"<html><head>
+            <meta name="citation_title" content="A proceedings paper">
+            <meta name="description" content="Truncated abstract...">
+        </head><body>
+            <p>Navigation text</p>
+            <section class="paper-section">
+                <h2 class="section-label">Abstract</h2>
+                <p class="paper-abstract">We study <em>private streams</em> and give an
+                efficient algorithm with improved accuracy. Our analysis establishes
+                bounds on both the error and the required space.</p>
+            </section>
+        </body></html>"#;
+        assert!(static_page_title_matches(html, &paper));
+        assert!(paper_source(&paper).is_some());
+        let abstract_text = abstract_candidates(html, source_from_static_url(&url))
+            .into_iter()
+            .find_map(|abs| usable_abstract_for_title(abs, &paper.title));
+        assert_eq!(
+            abstract_text.as_deref(),
+            Some("We study private streams and give an efficient algorithm with improved accuracy. Our analysis establishes bounds on both the error and the required space.")
+        );
+        assert!(static_fetch_url("https://proceedings.iclr.cc.attacker.example/paper").is_none());
     }
 
     #[test]
