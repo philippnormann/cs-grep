@@ -233,6 +233,7 @@ fn push_word(out: &mut Vec<Tok>, word: String) -> Result<()> {
 struct Parser {
     toks: Vec<Tok>,
     pos: usize,
+    depth: usize,
 }
 
 impl Parser {
@@ -282,11 +283,18 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Result<Node> {
-        if matches!(self.peek(), Some(Tok::Not)) {
-            self.advance();
-            return Ok(Node::Not(Box::new(self.parse_unary()?)));
+        if self.depth == 64 {
+            return Err(Error::Query("query nesting exceeds 64 levels".into()));
         }
-        self.parse_primary()
+        self.depth += 1;
+        let result = if matches!(self.peek(), Some(Tok::Not)) {
+            self.advance();
+            self.parse_unary().map(|node| Node::Not(Box::new(node)))
+        } else {
+            self.parse_primary()
+        };
+        self.depth -= 1;
+        result
     }
 
     fn parse_primary(&mut self) -> Result<Node> {
@@ -469,6 +477,9 @@ fn filter_atom(field: MetadataField, node: Node, config: &Config) -> Result<Filt
 }
 
 pub fn parse(input: &str, config: &Config) -> Result<ParsedQuery> {
+    if input.contains('\0') {
+        return Err(Error::Query("query contains a null byte".into()));
+    }
     let mut tokens = tokenize(input)?;
     if tokens.is_empty() {
         return Ok(ParsedQuery::default());
@@ -502,6 +513,7 @@ pub fn parse(input: &str, config: &Config) -> Result<ParsedQuery> {
     let text = Parser {
         toks: tokens,
         pos: 0,
+        depth: 0,
     }
     .parse()?;
     let fts = render_text_root(&text)?;
@@ -510,6 +522,7 @@ pub fn parse(input: &str, config: &Config) -> Result<ParsedQuery> {
             Parser {
                 toks: tokens,
                 pos: 0,
+                depth: 0,
             }
             .parse()
         })
@@ -647,9 +660,28 @@ mod tests {
 
     #[test]
     fn syntax_errors_are_strict() {
+        assert!(parse("\0", &config()).is_err());
         assert!(parse("NOT windows", &config()).is_err());
         assert!(parse("(a OR b", &config()).is_err());
         assert!(parse("\"unterminated", &config()).is_err());
         assert!(parse("foo:bar", &config()).is_err());
+    }
+
+    #[test]
+    fn excessive_nesting_returns_an_error_without_overflowing_the_stack() {
+        for input in [
+            format!("{}term{}", "(".repeat(1000), ")".repeat(1000)),
+            format!("{}term", "NOT ".repeat(1000)),
+        ] {
+            let error = parse(&input, &config()).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("query nesting exceeds 64 levels"));
+        }
+        assert!(parse(
+            &format!("{}term{}", "(".repeat(63), ")".repeat(63)),
+            &config()
+        )
+        .is_ok());
     }
 }

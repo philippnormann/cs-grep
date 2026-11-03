@@ -14,7 +14,7 @@ repository = "https://github.com/philippnormann/cs-grep"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled", "hooks"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "gzip", "query"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
 futures = "0.3"

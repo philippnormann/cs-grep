@@ -1,6 +1,7 @@
 //! SQLite storage with an FTS5 full-text index over papers.
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use rusqlite::{params_from_iter, types::Value, Connection, OpenFlags, OptionalExtension, Row};
 
@@ -97,6 +98,24 @@ impl Database {
     pub fn open_existing(path: &Path) -> Result<Self> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         Self::init(conn)
+    }
+
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        // Fail now, not on the first search, if this isn't a cs-grep database.
+        conn.prepare(&format!(
+            "SELECT {PAPER_COLUMNS_WITH_ALIAS} FROM papers_fts f JOIN papers p ON p.id = f.rowid \
+             WHERE papers_fts MATCH ?1 LIMIT 0"
+        ))?;
+        Ok(Self { conn })
+    }
+
+    /// Interrupt statements that are still running after `limit`.
+    pub fn set_time_limit(&self, limit: Duration) -> Result<()> {
+        let deadline = Instant::now() + limit;
+        self.conn
+            .progress_handler(1000, Some(move || Instant::now() >= deadline))?;
+        Ok(())
     }
 
     pub fn open_in_memory() -> Result<Self> {
@@ -211,9 +230,16 @@ impl Database {
     pub fn search(&self, q: &Search) -> Result<Vec<Paper>> {
         let mut parts = search_query_parts(q);
         let order = order_clause(q, &mut parts.args);
+        // bm25() needs the FTS table in the outer query, so relevance pages sort in place.
+        let id_page = q.limit.is_some() && !(q.fts.is_some() && matches!(q.sort, Sort::Relevance));
+        let columns = if id_page {
+            "p.id"
+        } else {
+            PAPER_COLUMNS_WITH_ALIAS
+        };
 
         let mut sql = format!(
-            "SELECT {PAPER_COLUMNS_WITH_ALIAS} FROM {} {} {order}",
+            "SELECT {columns} FROM {} {} {order}",
             parts.from, parts.where_sql
         );
         if let Some(n) = q.limit {
@@ -228,6 +254,12 @@ impl Database {
             let next = parts.args.len() + 1;
             sql.push_str(&format!(" OFFSET ?{next}"));
             parts.args.push((n as i64).into());
+        }
+        if id_page {
+            // Sort and page ids first so abstracts stay out of the sort.
+            sql = format!(
+                "SELECT {PAPER_COLUMNS_WITH_ALIAS} FROM papers p WHERE p.id IN ({sql}) {order}"
+            );
         }
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
@@ -313,7 +345,7 @@ fn year_ranges_clause(column: &str, ranges: &[YearRange], args: &mut Vec<Value>)
 }
 
 fn order_clause(q: &Search, args: &mut Vec<Value>) -> String {
-    match &q.sort {
+    let order = match &q.sort {
         Sort::Relevance if q.fts.is_some() => "ORDER BY bm25(papers_fts), p.year DESC".to_string(),
         Sort::Venue => "ORDER BY p.venue ASC, p.year DESC".to_string(),
         Sort::Rank(order) if order.iter().any(|venues| !venues.is_empty()) => {
@@ -326,7 +358,9 @@ fn order_clause(q: &Search, args: &mut Vec<Value>) -> String {
         Sort::Relevance | Sort::Year | Sort::Rank(_) => {
             "ORDER BY p.year DESC, p.venue ASC".to_string()
         }
-    }
+    };
+    // Tie-break on id so pages neither repeat nor skip rows.
+    format!("{order}, p.id ASC")
 }
 
 fn rank_groups_clause(column: &str, start: usize, groups: &[Vec<String>]) -> String {
@@ -527,6 +561,31 @@ mod tests {
     }
 
     #[test]
+    fn read_only_database_requires_valid_schema_and_rejects_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("papers.db");
+        let original = paper("k1", "NDSS", 2026, "Kernel", Some("Original abstract"));
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.upsert_papers(std::slice::from_ref(&original)).unwrap();
+        }
+        let mut db = Database::open_read_only(&path).unwrap();
+        assert_eq!(
+            db.search(&Search::default()).unwrap(),
+            vec![original.clone()]
+        );
+        assert!(db
+            .set_abstracts(&[("k1".into(), "Replacement".into())])
+            .is_err());
+        assert_eq!(db.get_by_key("k1").unwrap(), Some(original));
+
+        assert!(Database::open_read_only(&dir.path().join("missing.db")).is_err());
+        let invalid = dir.path().join("invalid.db");
+        std::fs::write(&invalid, "").unwrap();
+        assert!(Database::open_read_only(&invalid).is_err());
+    }
+
+    #[test]
     fn upsert_is_idempotent_and_updates() {
         let mut db = seeded();
         db.upsert_papers(&[paper(
@@ -705,6 +764,62 @@ mod tests {
         let hits = db.search(&search).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].dblp_key, "k1");
+    }
+
+    #[test]
+    fn pagination_matches_slices_of_the_full_result() {
+        let mut db = Database::open_in_memory().unwrap();
+        db.upsert_papers(&[
+            paper("z", "NDSS", 2026, "Kernel", Some("Findings")),
+            paper("a", "NDSS", 2026, "Kernel", Some("Findings")),
+            paper("x", "SP", 2025, "Other research", None),
+            paper("b", "NDSS", 2026, "Kernel", Some("Findings")),
+            paper("c", "CCS", 2024, "Kernel", Some("Findings")),
+        ])
+        .unwrap();
+        // Ties must not depend on SQLite's scan order.
+        db.conn
+            .pragma_update(None, "reverse_unordered_selects", true)
+            .unwrap();
+        let filter = FilterExpr::And(vec![
+            FilterExpr::Or(vec![
+                FilterExpr::Year(YearRange::single(2026)),
+                FilterExpr::Venue(vec!["CCS".into()]),
+            ]),
+            FilterExpr::Not(Box::new(FilterExpr::Doi("excluded".into()))),
+        ]);
+        for sort in [
+            Sort::Relevance,
+            Sort::Year,
+            Sort::Venue,
+            Sort::Rank(vec![vec!["SP".into(), "NDSS".into()], vec!["CCS".into()]]),
+        ] {
+            for fts in [None, Some("kernel".into())] {
+                for filter in [None, Some(filter.clone())] {
+                    let mut search = Search {
+                        sort: sort.clone(),
+                        fts: fts.clone(),
+                        filter,
+                        ..Default::default()
+                    };
+                    let all = db.search(&search).unwrap();
+                    for offset in [0, 1, all.len()] {
+                        for limit in [None, Some(1), Some(2)] {
+                            search.limit = limit;
+                            search.offset = Some(offset);
+                            let expected: Vec<_> = all
+                                .iter()
+                                .skip(offset)
+                                .take(limit.unwrap_or(usize::MAX))
+                                .cloned()
+                                .collect();
+                            assert_eq!(db.search(&search).unwrap(), expected, "{search:?}");
+                            assert_eq!(db.search_count(&search).unwrap(), all.len());
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
