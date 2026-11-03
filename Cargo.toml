@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/cs-grep-core", "crates/cs-grep"]
+members = ["crates/cs-grep-core", "crates/cs-grep", "crates/cs-grep-web"]
+default-members = ["crates/cs-grep-core", "crates/cs-grep"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,13 +15,15 @@ repository = "https://github.com/philippnormann/cs-grep"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled", "hooks"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "gzip", "query"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
 futures = "0.3"
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dotenvy = "0.15"
 scraper = "0.27"
 csv = "1"
@@ -29,3 +32,4 @@ crossterm = "0.29"
 directories = "6"
 tempfile = "3"
 url = "2"
+axum = "0.8"

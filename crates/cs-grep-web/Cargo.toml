@@ -1,0 +1,29 @@
+[package]
+name = "cs-grep-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "cs-grep-web"
+path = "src/main.rs"
+
+[dependencies]
+cs-grep-core = { path = "../cs-grep-core" }
+tokio = { workspace = true, features = ["sync", "time"] }
+axum = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+tower = { version = "0.5", features = ["util"] }

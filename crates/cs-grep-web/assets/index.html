@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>cs-grep</title>
+<link rel="stylesheet" href="static/styles.css" />
+<script>
+(function () {
+  let saved;
+  try { saved = localStorage.getItem('theme'); } catch { /* Storage is optional. */ }
+  const theme = saved === 'light' || saved === 'dark' ? saved : (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+  document.documentElement.dataset.theme = theme;
+})();
+</script>
+</head>
+<body>
+<div class="app">
+  <header class="header">
+    <div class="search-row">
+      <input id="search" class="search-input" type="text" placeholder="all papers" aria-label="Search papers" value="" autocomplete="off" />
+      <div class="sort-bar" role="group" aria-label="Sort papers">
+        <button class="sort-btn active" data-sort="year" aria-pressed="true">year</button>
+        <button class="sort-btn" data-sort="rank" aria-pressed="false">rank</button>
+        <button class="sort-btn" data-sort="relevance" aria-pressed="false">relevance</button>
+        <button class="sort-btn" data-sort="venue" aria-pressed="false">venue</button>
+      </div>
+    </div>
+    <div id="status" class="status" role="status" aria-live="polite"></div>
+  </header>
+  <main class="main">
+    <section id="results" class="results" role="listbox" aria-label="Search results" tabindex="0">
+      <div id="sentinel" class="sentinel" aria-hidden="true"></div>
+    </section>
+    <aside id="detail" class="detail" aria-label="Selected paper"></aside>
+  </main>
+  <footer class="footer">
+    <span class="hint">Enter open · ↑↓ move · <code>title:fuzzing WHERE year:2020-</code></span>
+    <nav class="footer-links" aria-label="Project links">
+      <a href="https://github.com/philippnormann/cs-grep" target="_blank" rel="noopener noreferrer">GitHub / CLI</a>
+      <a href="https://github.com/philippnormann/cs-grep#http-api" target="_blank" rel="noopener noreferrer">API docs</a>
+    </nav>
+    <button id="theme-toggle" class="theme-toggle" aria-label="Toggle theme" title="Toggle theme">
+      <svg class="icon-sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>
+      <svg class="icon-moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
+    </button>
+  </footer>
+</div>
+<dialog id="bibtex-modal" class="modal" aria-labelledby="bibtex-heading">
+  <div class="modal-header">
+    <h3 id="bibtex-heading">BibTeX</h3>
+    <button class="modal-close" id="modal-close" aria-label="Close BibTeX" autofocus>&times;</button>
+  </div>
+  <pre><code id="bibtex-code"></code></pre>
+  <p id="modal-status" class="modal-status" role="status" aria-live="polite"></p>
+  <div class="modal-actions">
+    <button id="modal-copy" class="modal-btn">Copy</button>
+    <button id="modal-download" class="modal-btn">Download</button>
+  </div>
+</dialog>
+<script src="static/app.js"></script>
+</body>
+</html>

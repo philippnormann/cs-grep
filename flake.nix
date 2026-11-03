@@ -53,6 +53,19 @@
               doCheck = false;
             };
 
+          csGrepWeb =
+            with pkgs;
+            rustPlatform.buildRustPackage {
+              inherit src;
+              name = "cs-grep-web";
+              version = manifest.version;
+              cargoLock = {
+                lockFile = ./Cargo.lock;
+              };
+              doCheck = false;
+              cargoBuildFlags = [ "-p" "cs-grep-web" ];
+            };
+
         in
         {
           # auto formatting
@@ -64,7 +77,7 @@
           };
 
           packages = {
-            inherit csGrep;
+            inherit csGrep csGrepWeb;
             default = csGrep;
           };
 
