@@ -1,278 +1,110 @@
-const LOAD_BATCH = 120;
+const PAGE_SIZE = 120;
+const LOAD_MARGIN = 200;
 const SEARCH_DEBOUNCE_MS = 300;
-const SORTS = ['year', 'rank', 'relevance', 'venue'];
-
+const byId = (id) => document.getElementById(id);
 const dom = {
-  searchInput: null,
-  results: null,
-  status: null,
-  detail: null,
-  sortButtons: [],
-  sentinel: null,
-  modal: null,
-  modalCode: null,
-  modalClose: null,
-  modalCopy: null,
-  modalDownload: null,
-  themeToggle: null,
+  search: byId('search'),
+  sortButtons: document.querySelectorAll('.sort-btn'),
+  status: byId('status'),
+  results: byId('results'),
+  sentinel: byId('sentinel'),
+  detail: byId('detail'),
+  modal: byId('bibtex-modal'),
+  modalCode: byId('bibtex-code'),
+  modalStatus: byId('modal-status'),
+  modalClose: byId('modal-close'),
+  modalCopy: byId('modal-copy'),
+  modalDownload: byId('modal-download'),
+  themeToggle: byId('theme-toggle'),
 };
-
 const state = {
-  query: '',
   sort: 'year',
   results: [],
   ranks: {},
-  selected: 0,
+  selected: null,
+  nextOffset: null,
   loading: false,
-  hasMore: false,
-  error: '',
-  bibtex: '',
-  bibtexKey: '',
 };
+let searchController;
+let bibtexController;
+let debounceTimer;
+let bibtex = '';
+let bibtexKey = '';
 
-let debounceTimer = null;
-let sentinelObserver = null;
-
-function init() {
-  dom.searchInput = document.getElementById('search');
-  dom.results = document.getElementById('results');
-  dom.status = document.getElementById('status');
-  dom.detail = document.getElementById('detail');
-  dom.sortButtons = Array.from(document.querySelectorAll('.sort-btn'));
-
-  dom.sentinel = document.createElement('div');
-  dom.sentinel.className = 'sentinel';
-  dom.results.appendChild(dom.sentinel);
-
-  dom.modal = document.getElementById('bibtex-modal');
-  dom.modalCode = document.getElementById('bibtex-code');
-  dom.modalClose = document.getElementById('modal-close');
-  dom.modalCopy = document.getElementById('modal-copy');
-  dom.modalDownload = document.getElementById('modal-download');
-  dom.themeToggle = document.getElementById('theme-toggle');
-
-  initTheme();
-  bindEvents();
-  setupInfiniteScroll();
-  renderSortButtons();
-  renderStatus();
-
-  runSearch({ reset: true }).then(() => {
-    dom.searchInput.focus();
-  });
-}
-
-function bindEvents() {
-  dom.themeToggle.addEventListener('click', toggleTheme);
-  dom.searchInput.addEventListener('input', onSearchInput);
-  dom.searchInput.addEventListener('keydown', onSearchKeyDown);
-  dom.results.addEventListener('click', onResultsClick);
-  dom.results.addEventListener('dblclick', onResultsDoubleClick);
-  window.addEventListener('keydown', onGlobalKeyDown);
-
-  dom.sortButtons.forEach((button) => {
-    button.addEventListener('click', () => setSort(button.dataset.sort));
-  });
-
-  dom.modalClose.addEventListener('click', closeModal);
-  dom.modal.addEventListener('click', (e) => {
-    if (e.target === dom.modal) closeModal();
-  });
-  dom.modalCopy.addEventListener('click', copyBibTeX);
-  dom.modalDownload.addEventListener('click', downloadBibTeX);
-}
-
-function setupInfiniteScroll() {
-  sentinelObserver = new IntersectionObserver(
-    (entries) => {
-      if (entries[0]?.isIntersecting) {
-        runSearch({ reset: false });
-      }
-    },
-    {
-      root: dom.results,
-      rootMargin: '100px',
-    },
-  );
-
-  sentinelObserver.observe(dom.sentinel);
-}
-
-function onSearchInput() {
-  state.query = dom.searchInput.value;
-  scheduleSearch();
-}
-
-function onSearchKeyDown(event) {
-  if (event.key === 'Enter') {
-    event.preventDefault();
-    openSelected();
-  }
-}
-
-function onResultsClick(event) {
-  const index = getEventRowIndex(event);
-  if (index === null) {
-    return;
-  }
-
-  setSelected(index);
-}
-
-function onResultsDoubleClick(event) {
-  const index = getEventRowIndex(event);
-  if (index === null) {
-    return;
-  }
-
-  setSelected(index);
-  openSelected();
-}
-
-function onGlobalKeyDown(event) {
-  if (event.key === 'Escape' && !dom.modal.classList.contains('hidden')) {
-    event.preventDefault();
-    closeModal();
-    return;
-  }
-
-  if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) {
-    return;
-  }
-
-  switch (event.key) {
-    case 'ArrowDown': {
-      if (!state.results.length) {
-        return;
-      }
-      event.preventDefault();
-      setSelected(state.selected + 1, { scrollIntoView: true });
-      maybeLoadMore();
-      break;
-    }
-    case 'ArrowUp': {
-      if (!state.results.length) {
-        return;
-      }
-      event.preventDefault();
-      setSelected(state.selected - 1, { scrollIntoView: true });
-      break;
-    }
-    case 'Enter': {
-      event.preventDefault();
-      openSelected();
-      break;
-    }
-    case 'Tab': {
-      event.preventDefault();
-      cycleSort(event.shiftKey ? -1 : 1);
-      break;
-    }
-  }
-}
-
-function setSort(sort) {
-  if (!SORTS.includes(sort) || state.sort === sort) {
-    return;
-  }
-
-  state.sort = sort;
-  renderSortButtons();
-  scheduleSearch();
-}
-
-function cycleSort(direction) {
-  const currentIndex = SORTS.indexOf(state.sort);
-  const nextIndex = (currentIndex + direction + SORTS.length) % SORTS.length;
-  setSort(SORTS[nextIndex]);
-}
-
-function scheduleSearch() {
-  if (debounceTimer) {
-    clearTimeout(debounceTimer);
-  }
-
-  debounceTimer = setTimeout(() => {
-    debounceTimer = null;
-    runSearch({ reset: true });
-  }, SEARCH_DEBOUNCE_MS);
-}
-
-async function runSearch({ reset }) {
-  if (!reset && (state.loading || !state.hasMore)) {
-    return;
-  }
-
+function startSearch(delay = 0) {
+  clearTimeout(debounceTimer);
+  searchController?.abort();
+  // The old selection and next page belong to the previous query.
+  markRow(dom.results.querySelector('.selected'), false);
+  state.selected = null;
+  state.nextOffset = null;
   state.loading = true;
-  state.error = '';
+  renderDetail();
   renderStatus();
+  debounceTimer = setTimeout(() => loadPage(true), delay);
+}
 
-  const offset = reset ? 0 : state.results.length;
+function loadIfNearEnd() {
+  const viewport = dom.results.getBoundingClientRect();
+  if (dom.sentinel.getBoundingClientRect().top <= viewport.bottom + LOAD_MARGIN) loadPage(false);
+}
+
+async function loadPage(reset) {
+  if (!reset && (state.loading || state.nextOffset == null)) return;
+  searchController?.abort();
+  const controller = new AbortController();
+  searchController = controller;
+  state.loading = true;
+  renderStatus();
   const params = new URLSearchParams({
-    q: state.query,
+    q: dom.search.value,
     sort: state.sort,
-    limit: String(LOAD_BATCH),
-    offset: String(offset),
+    limit: PAGE_SIZE,
+    offset: reset ? 0 : state.nextOffset,
   });
-
+  let error = '';
+  let status = 0;
   try {
-    const response = await fetch(`/api/search?${params.toString()}`);
-    const data = await response.json();
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${data.error}`);
+    const response = await fetch(`api/search?${params}`, { signal: controller.signal });
+    status = response.status;
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !Array.isArray(data.papers)) {
+      throw new Error(data.error || `Search failed (${status})`);
     }
-    const papers = Array.isArray(data.papers) ? data.papers : [];
-    if (data.ranks && typeof data.ranks === 'object') {
-      state.ranks = data.ranks;
-    }
-
+    if (controller.signal.aborted) return;
+    state.ranks = data.ranks || {};
     if (reset) {
-      state.results = papers;
-      state.selected = 0;
-      state.hasMore = papers.length >= LOAD_BATCH;
+      state.results = [];
+      state.selected = data.papers[0] || null;
+      dom.results.replaceChildren(dom.sentinel);
+      dom.results.removeAttribute('aria-activedescendant');
       dom.results.scrollTop = 0;
-      dom.results.querySelectorAll('.result-row').forEach((row) => row.remove());
-      appendResults(papers, 0);
-    } else {
-      if (papers.length === 0) {
-        state.hasMore = false;
-        renderStatus();
-        return;
-      }
-      const startIndex = state.results.length;
-      state.results = state.results.concat(papers);
-      state.hasMore = papers.length >= LOAD_BATCH;
-      appendResults(papers, startIndex);
     }
-
-    renderDetail();
-    renderStatus();
-  } catch (error) {
-    state.error = error.message || 'search failed';
-    renderStatus();
+    dom.sentinel.before(createRows(data.papers, state.results.length));
+    state.results.push(...data.papers);
+    state.nextOffset = data.next_offset;
+    if (reset) renderDetail();
+  } catch (e) {
+    error = e.message || 'Search failed';
   } finally {
-    state.loading = false;
-    renderStatus();
+    if (!controller.signal.aborted) {
+      state.loading = false;
+      // Retrying a rejected query can't help; network and server errors may clear up.
+      const retryable = error && (status < 400 || status >= 500);
+      renderStatus(error, retryable ? () => loadPage(reset) : null);
+      if (!error) loadIfNearEnd();
+    }
   }
 }
 
-function renderSortButtons() {
-  dom.sortButtons.forEach((button) => {
-    button.classList.toggle('active', button.dataset.sort === state.sort);
-  });
-}
-
-function appendResults(papers, startIndex) {
+function createRows(papers, offset) {
   const fragment = document.createDocumentFragment();
-
-  papers.forEach((paper, offset) => {
-    const index = startIndex + offset;
-    const row = document.createElement('div');
-    row.className = 'result-row';
-    row.dataset.index = String(index);
-    if (index === state.selected) {
-      row.classList.add('selected');
-    }
+  papers.forEach((paper, index) => {
+    const row = el('div', 'result-row');
+    row.id = `result-${offset + index}`;
+    row.dataset.index = offset + index;
+    row.setAttribute('role', 'option');
+    row.setAttribute('aria-selected', 'false');
     row.appendChild(el('span', 'col-venue', paper.venue || ''));
     row.appendChild(el('span', 'col-year', paper.year ?? ''));
     const rank = state.ranks[paper.venue];
@@ -280,259 +112,239 @@ function appendResults(papers, startIndex) {
     row.appendChild(el('span', 'col-title', paper.title || ''));
     row.appendChild(el('span', 'col-authors', paper.authors || ''));
     fragment.appendChild(row);
+    if (paper === state.selected) markRow(row, true);
   });
-
-  dom.results.insertBefore(fragment, dom.sentinel);
+  return fragment;
 }
 
-function setSelected(index, options = {}) {
-  if (!state.results.length) {
-    return;
-  }
+function markRow(row, selected) {
+  if (!row) return;
+  row.classList.toggle('selected', selected);
+  row.setAttribute('aria-selected', selected);
+  if (selected) dom.results.setAttribute('aria-activedescendant', row.id);
+  else dom.results.removeAttribute('aria-activedescendant');
+}
 
-  const nextIndex = Math.max(0, Math.min(index, state.results.length - 1));
-  const previousIndex = state.selected;
-
-  if (nextIndex === previousIndex) {
-    if (options.scrollIntoView) {
-      const row = dom.results.querySelector(`.result-row[data-index="${nextIndex}"]`);
-      if (row) {
-        row.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-      }
-    }
-    return;
-  }
-
-  state.selected = nextIndex;
-  updateRowSelection(previousIndex, false);
-  updateRowSelection(nextIndex, true);
+function setSelected(index) {
+  const next = Math.max(0, Math.min(index, state.results.length - 1));
+  if (state.results[next] === state.selected) return;
+  markRow(dom.results.querySelector('.selected'), false);
+  state.selected = state.results[next];
+  const row = byId(`result-${next}`);
+  markRow(row, true);
+  row.scrollIntoView({ block: 'nearest' });
+  // Re-rendering the detail pane would drop focus that is inside it.
+  if (dom.detail.contains(document.activeElement)) dom.results.focus();
   renderDetail();
-  renderStatus();
-
-  if (options.scrollIntoView) {
-    const row = dom.results.querySelector(`.result-row[data-index="${nextIndex}"]`);
-    if (row) {
-      row.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-    }
-  }
 }
 
-function updateRowSelection(index, selected) {
-  const row = dom.results.querySelector(`.result-row[data-index="${index}"]`);
-  if (row) {
-    row.classList.toggle('selected', selected);
+function paperUrl(paper) {
+  for (const value of [paper.url, paper.doi ? `https://doi.org/${paper.doi}` : '']) {
+    try {
+      const url = new URL(value);
+      if (url.protocol === 'http:' || url.protocol === 'https:') return url.href;
+    } catch { /* Ignore missing or malformed publisher links. */ }
   }
+  return '';
 }
 
 function renderDetail() {
   dom.detail.replaceChildren();
-
-  const paper = state.results[state.selected];
+  dom.detail.scrollTop = 0;
+  const paper = state.selected;
   if (!paper) {
     dom.detail.appendChild(el('div', 'detail-empty', 'No paper selected'));
     return;
   }
-
-  const content = document.createElement('div');
-  content.className = 'detail-content';
-
+  const content = el('div', 'detail-content');
   content.appendChild(el('h2', 'detail-title', paper.title || ''));
-
-  const metaParts = [paper.venue || '', paper.year ?? ''].filter(Boolean);
+  const meta = [paper.venue, paper.year];
   const rank = state.ranks[paper.venue];
-  if (rank) {
-    metaParts.push(`rank ${rank}`);
-  }
-  content.appendChild(el('div', 'detail-meta', metaParts.join(' · ')));
-
+  if (rank) meta.push(`rank ${rank}`);
+  content.appendChild(el('div', 'detail-meta', meta.filter(Boolean).join(' · ')));
   content.appendChild(labeledBlock('detail-authors', 'Authors', paper.authors || ''));
-
-  if (paper.doi) {
-    content.appendChild(labeledBlock('detail-link', 'DOI', paper.doi));
-  }
-
-  const url = paper.url || (paper.doi ? `https://doi.org/${paper.doi}` : '');
+  if (paper.doi) content.appendChild(labeledBlock('detail-link', 'DOI', paper.doi));
+  const url = paperUrl(paper);
   if (url) {
-    const linkBlock = document.createElement('div');
-    linkBlock.className = 'detail-link';
-    linkBlock.appendChild(el('strong', '', 'URL'));
-    linkBlock.appendChild(document.createTextNode(' '));
-
-    const link = document.createElement('a');
+    const block = labeledBlock('detail-link', 'URL', '');
+    const link = el('a', '', url);
     link.href = url;
     link.target = '_blank';
     link.rel = 'noreferrer';
-    link.textContent = url;
-    linkBlock.appendChild(link);
-
-    content.appendChild(linkBlock);
+    block.appendChild(link);
+    content.appendChild(block);
   }
-
-  const citationBlock = document.createElement('div');
-  citationBlock.className = 'detail-link';
-  citationBlock.appendChild(el('strong', '', 'Citation'));
-
-  const bibtexBtn = document.createElement('button');
-  bibtexBtn.className = 'download-btn';
-  bibtexBtn.textContent = 'BibTeX';
-  bibtexBtn.onclick = async () => {
-    state.error = '';
-    renderStatus();
-    try {
-      const paper = state.results[state.selected];
-      const response = await fetch(`/api/bibtex?key=${encodeURIComponent(paper.dblp_key)}`);
-      if (response.ok) {
-        const bibtex = await response.text();
-        openModal(bibtex, paper.dblp_key);
-      } else {
-        state.error = 'Failed to fetch BibTeX';
-        renderStatus();
-      }
-    } catch (e) {
-      state.error = e.message || 'Error fetching BibTeX';
-      renderStatus();
-    }
-  };
-  citationBlock.appendChild(bibtexBtn);
-  content.appendChild(citationBlock);
-
-  const abstractBlock = document.createElement('div');
-  abstractBlock.className = 'detail-abstract';
-  abstractBlock.appendChild(el('strong', '', 'Abstract'));
-
-  const abstractText = document.createElement('p');
-  abstractText.textContent = paper.abstract || 'No abstract available.';
-  abstractBlock.appendChild(abstractText);
-
-  content.appendChild(abstractBlock);
+  const citation = labeledBlock('detail-link', 'Citation', '');
+  const button = el('button', 'download-btn', 'BibTeX');
+  button.addEventListener('click', () => openBibtex(paper));
+  citation.appendChild(button);
+  content.appendChild(citation);
+  const abstract = el('div', 'detail-abstract');
+  abstract.appendChild(el('strong', '', 'Abstract'));
+  abstract.appendChild(el('p', '', paper.abstract || 'No abstract available.'));
+  content.appendChild(abstract);
   dom.detail.appendChild(content);
 }
 
-function renderStatus() {
-  dom.status.replaceChildren();
-
-  if (state.error) {
-    dom.status.appendChild(el('span', 'error', state.error));
+// Errors are passed in rather than stored, so the next render clears them and their Retry button.
+function renderStatus(error = '', retry = null) {
+  dom.results.setAttribute('aria-busy', state.loading);
+  if (error) {
+    dom.status.replaceChildren(el('span', 'error', error));
+    if (retry) {
+      const button = el('button', 'modal-btn', 'Retry');
+      button.addEventListener('click', () => {
+        dom.search.focus();
+        retry();
+      });
+      dom.status.appendChild(button);
+    }
     return;
   }
-
-  if (state.results.length > 0 || state.loading) {
-    const selection = state.results.length ? ` · ${state.selected + 1}/${state.results.length}` : '';
-    const count = `${state.results.length}${state.hasMore ? '+' : ''} papers`;
-    dom.status.appendChild(el('span', '', `${count} · sort ${state.sort}${selection}`));
+  // A new search has no next page yet, and the old count no longer applies.
+  if (state.loading && state.nextOffset == null) {
+    dom.status.replaceChildren(el('span', '', 'Loading…'));
+    return;
   }
+  const count = state.results.length;
+  const more = state.nextOffset == null ? '' : '+';
+  const summary = count ? `${count}${more} paper${count === 1 ? '' : 's'}` : 'No papers found';
+  dom.status.replaceChildren(el('span', '', summary));
+  if (state.loading) dom.status.appendChild(el('span', 'spinner', 'Loading…'));
+}
 
-  if (state.loading) {
-    dom.status.appendChild(el('span', 'spinner', 'Loading…'));
+function onNavigation(event) {
+  if (event.defaultPrevented || event.isComposing || dom.modal.open) return;
+  if (event.metaKey || event.ctrlKey || event.altKey) return;
+  if (event.target === dom.results && (event.key.length === 1 || event.key === 'Backspace')) {
+    // Typing in the result list goes to the search box.
+    dom.search.focus();
+  } else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+    if (!state.results.length) return;
+    event.preventDefault();
+    const next = state.results.indexOf(state.selected) + (event.key === 'ArrowDown' ? 1 : -1);
+    if (next >= state.results.length - 5) loadPage(false);
+    setSelected(next);
+  } else if (event.key === 'Enter' && !event.target.closest('button, a')) {
+    event.preventDefault();
+    openSelected();
   }
 }
 
 function openSelected() {
-  const paper = state.results[state.selected];
-  if (!paper) {
-    return;
-  }
+  const paper = state.selected;
+  if (!paper) return;
+  const url = paperUrl(paper);
+  if (url) window.open(url, '_blank', 'noopener,noreferrer');
+}
 
-  const url = paper.url || (paper.doi ? `https://doi.org/${paper.doi}` : '');
-  if (url) {
-    window.open(url, '_blank');
+async function openBibtex(paper) {
+  bibtexController?.abort();
+  const controller = new AbortController();
+  bibtexController = controller;
+  bibtex = '';
+  bibtexKey = paper.dblp_key;
+  dom.modalCode.textContent = 'Loading…';
+  dom.modalStatus.textContent = '';
+  dom.modalCopy.disabled = dom.modalDownload.disabled = true;
+  if (!dom.modal.open) dom.modal.showModal();
+  try {
+    const url = `api/bibtex?key=${encodeURIComponent(paper.dblp_key)}`;
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      throw new Error(data.error || `BibTeX failed (${response.status})`);
+    }
+    const text = await response.text();
+    if (controller.signal.aborted) return;
+    bibtex = text;
+    dom.modalCode.textContent = text;
+    dom.modalCopy.disabled = dom.modalDownload.disabled = false;
+  } catch (error) {
+    if (controller.signal.aborted) return;
+    dom.modalCode.textContent = '';
+    dom.modalStatus.textContent = error.message || 'Failed to fetch BibTeX';
   }
 }
 
-function maybeLoadMore() {
-  if (state.selected >= state.results.length - 5) {
-    runSearch({ reset: false });
+async function copyBibtex() {
+  const controller = bibtexController;
+  try {
+    await navigator.clipboard.writeText(bibtex);
+    if (controller.signal.aborted) return;
+    dom.modalStatus.textContent = 'Copied!';
+  } catch {
+    if (controller.signal.aborted) return;
+    dom.modalStatus.textContent = 'Copy failed. Select the citation above or download it.';
   }
 }
 
-function getEventRowIndex(event) {
-  const target = event.target instanceof Element ? event.target : null;
-  const row = target ? target.closest('.result-row') : null;
-  if (!row) {
-    return null;
-  }
-
-  const index = Number.parseInt(row.dataset.index || '', 10);
-  return Number.isNaN(index) ? null : index;
+function downloadBibtex() {
+  const url = URL.createObjectURL(new Blob([bibtex], { type: 'text/plain' }));
+  const link = el('a');
+  link.href = url;
+  link.download = `${bibtexKey.split('/').pop()}.bib`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+  dom.modalStatus.textContent = '';
 }
 
-function el(tag, className, text) {
-  const e = document.createElement(tag);
-  if (className) e.className = className;
-  if (text !== undefined && text !== null) e.textContent = text;
-  return e;
+function el(tag, className = '', text = '') {
+  const element = document.createElement(tag);
+  element.className = className;
+  element.textContent = text;
+  return element;
 }
 
 function labeledBlock(className, label, text) {
-  const block = document.createElement('div');
-  block.className = className;
+  const block = el('div', className);
   block.appendChild(el('strong', '', label));
   block.appendChild(document.createTextNode(` ${text}`));
   return block;
 }
 
-function openModal(bibtex, key) {
-  state.bibtex = bibtex;
-  state.bibtexKey = key;
-  dom.modalCode.textContent = bibtex;
-  dom.modal.classList.remove('hidden');
-}
-
-function closeModal() {
-  dom.modal.classList.add('hidden');
-  state.bibtex = '';
-  state.bibtexKey = '';
-}
-
-async function copyBibTeX() {
-  try {
-    await navigator.clipboard.writeText(state.bibtex);
-    const original = dom.modalCopy.textContent;
-    dom.modalCopy.textContent = 'Copied!';
-    setTimeout(() => {
-      dom.modalCopy.textContent = original;
-    }, 1200);
-  } catch (e) {
-    state.error = `Copy failed: ${e}`;
-    renderStatus();
-  }
-}
-
-function downloadBibTeX() {
-  const blob = new Blob([state.bibtex], { type: 'text/plain' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `bibtex_${state.bibtexKey}.bib`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
-}
-
-const THEME_KEY = 'theme';
-
-function initTheme() {
-  const saved = localStorage.getItem(THEME_KEY);
-  if (saved === 'light' || saved === 'dark') {
-    document.documentElement.dataset.theme = saved;
-    return;
-  }
-  const prefersLight = window.matchMedia('(prefers-color-scheme: light)').matches;
-  document.documentElement.dataset.theme = prefersLight ? 'light' : 'dark';
-}
-
-function toggleTheme() {
-  const current = document.documentElement.dataset.theme === 'light' ? 'light' : 'dark';
-  const next = current === 'dark' ? 'light' : 'dark';
-  document.documentElement.dataset.theme = next;
-  localStorage.setItem(THEME_KEY, next);
-}
-
-window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', (e) => {
-  if (!localStorage.getItem(THEME_KEY)) {
-    document.documentElement.dataset.theme = e.matches ? 'light' : 'dark';
-  }
+dom.search.addEventListener('input', () => startSearch(SEARCH_DEBOUNCE_MS));
+document.addEventListener('keydown', onNavigation);
+dom.results.addEventListener('click', (event) => {
+  const row = event.target.closest('.result-row');
+  if (row) setSelected(Number(row.dataset.index));
 });
-
-init();
+dom.results.addEventListener('dblclick', (event) => {
+  if (event.target.closest('.result-row')) openSelected();
+});
+new IntersectionObserver(loadIfNearEnd, { root: dom.results, rootMargin: `${LOAD_MARGIN}px` })
+  .observe(dom.sentinel);
+dom.sortButtons.forEach((button) => {
+  button.addEventListener('click', () => {
+    if (state.sort === button.dataset.sort) return;
+    state.sort = button.dataset.sort;
+    dom.sortButtons.forEach((item) => {
+      item.classList.toggle('active', item === button);
+      item.setAttribute('aria-pressed', item === button);
+    });
+    startSearch();
+  });
+});
+dom.modalClose.addEventListener('click', () => dom.modal.close());
+dom.modal.addEventListener('click', (event) => {
+  if (event.target === dom.modal) dom.modal.close();
+});
+dom.modal.addEventListener('close', () => {
+  // Reopening before this event fires has already started a new request.
+  if (!dom.modal.open) bibtexController?.abort();
+});
+dom.modalCopy.addEventListener('click', copyBibtex);
+dom.modalDownload.addEventListener('click', downloadBibtex);
+dom.themeToggle.addEventListener('click', () => {
+  const theme = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
+  document.documentElement.dataset.theme = theme;
+  localStorage.setItem('theme', theme);
+});
+window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', (event) => {
+  if (localStorage.getItem('theme')) return;
+  document.documentElement.dataset.theme = event.matches ? 'light' : 'dark';
+});
+startSearch();
+dom.search.focus();

@@ -42,6 +42,7 @@ body {
   display: flex;
   flex-direction: column;
   height: 100vh;
+  height: 100dvh;
 }
 .header {
   border-bottom: 1px solid var(--color-border);
@@ -51,11 +52,12 @@ body {
   display: flex;
   gap: 1rem;
   align-items: center;
-  margin-top: 0.5rem;  
+  margin-top: 0.5rem;
   margin-bottom: 0.5rem;
 }
 .search-input {
   flex: 1;
+  min-width: 0;
   background: var(--color-surface);
   border: 1px solid var(--color-border);
   border-radius: 0.5rem;
@@ -138,30 +140,22 @@ body {
 :root[data-theme="light"] .theme-toggle .icon-moon {
   display: none;
 }
-.modal-overlay {
-  position: fixed;
-  inset: 0;
-  background: var(--color-overlay);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 50;
-  padding: 1rem;
-}
-.modal-overlay.hidden {
-  display: none;
-}
+.modal::backdrop { background: var(--color-overlay); }
 .modal {
   background: var(--color-bg);
   border: 1px solid var(--color-border);
   border-radius: 0.5rem;
-  width: 100%;
+  width: calc(100% - 2rem);
   max-width: 44rem;
+  padding: 0;
+  color: var(--color-text);
+  box-sizing: border-box;
   max-height: 80vh;
-  display: flex;
-  flex-direction: column;
   box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.3);
 }
+.modal[open] { display: flex; flex-direction: column; }
+.modal-status { margin: 0; padding: 0 1rem; font-size: 0.875rem; }
+.modal-status:empty { display: none; }
 .modal-header {
   display: flex;
   align-items: center;
@@ -198,6 +192,7 @@ body {
   flex: 1 1 auto;
   min-height: 0;
 }
+.modal pre:has(> code:empty) { display: none; }
 .modal-actions {
   display: flex;
   gap: 0.5rem;
@@ -231,6 +226,7 @@ body {
   display: flex;
   align-items: center;
   gap: 0.5rem;
+  overflow-wrap: anywhere;
 }
 .status span {
   padding-left: 0.5rem;
@@ -245,27 +241,16 @@ body {
 }
 .results {
   flex: 1;
+  min-width: 0;
   overflow-y: auto;
   border-right: 1px solid var(--color-border);
 }
-@media (max-width: 900px) {
-  .main { flex-direction: column; overflow: auto; }
-  .results {
-    flex: none !important;
-    border-right: none;
-    border-bottom: 1px solid var(--color-border);
-    max-height: 40vh;
-    min-height: 180px;
-  }
-  .detail {
-    flex: 1 1 auto !important;
-    overflow-y: auto;
-  }
-}
 .result-row {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
+  display: grid;
+  grid-template-columns: minmax(0, 6rem) 2.5rem 3.5rem minmax(0, 1fr);
+  align-items: start;
+  column-gap: 0.75rem;
+  row-gap: 0.15rem;
   padding: 0.4rem 0.75rem;
   cursor: pointer;
   border-bottom: 1px solid var(--color-surface);
@@ -277,36 +262,40 @@ body {
   font-weight: 600;
 }
 .col-venue {
-  flex: 0 0 8rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
   color: var(--color-accent-tertiary);
   font-weight: 700;
 }
 .col-year {
-  flex: 0 0 2.5rem;
   color: var(--color-muted);
   text-align: right;
 }
 .col-rank {
-  flex: 0 0 3.5rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
   color: var(--color-dim);
   text-align: left;
 }
 .col-title {
-  flex: 1 1 auto;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  grid-column: 4;
+  white-space: normal;
+  overflow-wrap: anywhere;
   color: var(--color-text);
 }
 .col-authors {
-  flex: 0 0 16rem;
+  grid-column: 4;
+  font-size: 0.8125rem;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--color-muted);
 }
 .detail {
-  flex: 0 0 28rem;
+  flex: 0 0 34%;
+  max-width: 28rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
   overflow-y: auto;
   background: var(--color-bg);
 }
@@ -355,4 +344,33 @@ body {
   justify-content: space-between;
   gap: 0.5rem;
 }
+.footer-links { display: flex; align-items: center; gap: 0.5rem; white-space: nowrap; }
+.footer a { color: var(--color-accent-secondary); }
+.hint { flex: 1; }
+button:disabled { opacity: 0.5; cursor: default; }
+:focus-visible { outline: 2px solid var(--color-accent); outline-offset: -2px; }
 .sentinel { height: 1px; }
+@media (max-width: 900px) {
+  .main { flex-direction: column; overflow: auto; }
+  .results {
+    flex: none;
+    border-right: none;
+    border-bottom: 1px solid var(--color-border);
+    max-height: 40vh;
+    min-height: 180px;
+  }
+  .detail {
+    max-width: none;
+    flex: 1 1 auto;
+  }
+}
+@media (max-width: 600px) {
+  .header { padding: 0.5rem; }
+  .search-row { flex-wrap: wrap; gap: 0.5rem; }
+  .search-input { flex-basis: 100%; }
+  .status { font-size: 0.75rem; }
+  .result-row { grid-template-columns: minmax(0, 1fr) auto auto; }
+  .col-title, .col-authors { grid-column: 1 / -1; }
+  .footer { flex-wrap: wrap; }
+  .hint { flex-basis: 100%; }
+}
