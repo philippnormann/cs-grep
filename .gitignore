@@ -13,7 +13,3 @@
 *.db
 *.db-wal
 *.db-shm
-
-# Web
-web/dist/
-web/node_modules/

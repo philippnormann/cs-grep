@@ -12,7 +12,7 @@ authors, abstract, venue, year, rank, tag, and DOI.
 
 - Search across configurable computer science venue catalogs.
 - Keep the corpus local and query it quickly with SQLite/FTS5.
-- Search in the CLI or TUI, and export CSV, JSON, or BibTeX for scripts.
+- Search in the CLI, TUI, or browser, and export CSV, JSON, or BibTeX for scripts.
 
 ## Install
 
@@ -36,23 +36,6 @@ Or use [`nix`](https://nixos.org/):
 ```sh
 nix run "github:philippnormann/cs-grep" -- <arguments> # run once
 nix shell "github:philippnormann/cs-grep"              # add to PATH
-```
-
-### Docker / Podman
-
-Build the image (includes CLI, TUI, and Web UI):
-
-```sh
-podman build -t cs-grep:latest .
-```
-
-Run the Web UI:
-
-```sh
-podman-compose run --rm web /usr/local/bin/cs-grep init --db /data/papers.db
-podman-compose run --rm web /usr/local/bin/cs-grep update --db /data/papers.db --since 2018
-podman-compose up -d
-# open http://localhost:5002
 ```
 
 ## Use
@@ -220,6 +203,97 @@ OPENREVIEW_PASSWORD=
 ```
 
 `.env` is loaded automatically when present.
+
+## Web UI
+
+`cs-grep-web` serves a search page for your cs-grep database. It's useful for
+hosting one instance for your group, so everyone can search the same database
+without installing anything.
+
+```sh
+cargo install --git https://github.com/philippnormann/cs-grep cs-grep-web
+cs-grep-web  # http://localhost:5002
+```
+
+With Nix, run `nix run "github:philippnormann/cs-grep#csGrepWeb"`. Pass
+`--host 0.0.0.0` to allow remote access, and see `cs-grep-web --help` for other
+options. Restart the server after changing venues.
+
+### Docker
+
+```sh
+docker compose build
+docker compose run --rm web cs-grep --db /data/papers.db --config /data/config.yaml init
+docker compose run --rm web cs-grep --db /data/papers.db --config /data/config.yaml update --since 2018
+docker compose run --rm web cs-grep --db /data/papers.db --config /data/config.yaml enrich  # optional, adds abstracts
+docker compose up -d  # http://localhost:5002
+```
+
+The database and config live in a Docker volume. With Podman, use
+`podman compose`.
+
+To serve a database you already have (Linux paths shown):
+
+```sh
+docker run --rm --init --user "$(id -u):$(id -g)" -p 127.0.0.1:5002:5002 \
+  -v ~/.local/share/cs-grep:/data -v ~/.config/cs-grep:/config:ro cs-grep:latest \
+  cs-grep-web --host 0.0.0.0 --db /data/papers.db --config /config/config.yaml
+```
+
+To share it with your group, put it behind a reverse proxy with TLS and
+authentication, and run `update` (and optionally `enrich`) from cron. After
+changing venues, copy the config in with
+`docker compose cp config.yaml web:/data/config.yaml`, then run `update` and
+`docker compose restart`.
+
+### HTTP API
+
+#### `GET /api/search`
+
+| Parameter | Description |
+| --- | --- |
+| `q` | Query in the [query language](#query-language). Empty matches all papers. |
+| `sort` | `year` (default), `relevance`, `venue`, or `rank` |
+| `limit` | Results per page, 1-500 (default 120) |
+| `offset` | Results to skip (default 0) |
+
+```sh
+curl 'http://localhost:5002/api/search?q=fuzzing+WHERE+venue:NDSS+AND+year:2024&limit=1'
+```
+
+```json
+{
+  "papers": [
+    {
+      "dblp_key": "https://dblp.org/rec/conf/ndss/BorrelloFDBQG24",
+      "venue": "NDSS",
+      "year": 2024,
+      "title": "Predictive Context-sensitive Fuzzing.",
+      "authors": "Pietro Borrello, Andrea Fioraldi, Daniele Cono D'Elia, ...",
+      "doi": null,
+      "url": "https://www.ndss-symposium.org/ndss-paper/predictive-context-sensitive-fuzzing/",
+      "abstract": "Coverage-guided fuzzers expose bugs by progressively mutating testcases ..."
+    }
+  ],
+  "next_offset": 1,
+  "ranks": { "NDSS": "A*", "CCS": "A*" }
+}
+```
+
+For the next page, pass `next_offset` as `offset`. It is `null` on the last
+page. `ranks` maps each venue to its rank.
+
+#### `GET /api/bibtex?key=<dblp_key>`
+
+Returns the paper's BibTeX entry as plain text.
+
+#### Errors
+
+Errors come back as JSON with a 4xx or 5xx status:
+
+```json
+{ "error": "limit must be between 1 and 500" }
+```
 
 ## Acknowledgements
 

@@ -4,5 +4,3 @@ target/
 assets/
 Dockerfile
 docker-compose.yml
-web/dist/
-web/node_modules/

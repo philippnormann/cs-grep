@@ -1,10 +1,12 @@
 services:
   web:
+    image: cs-grep:latest
+    init: true
     build:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "5002:5002"
+      - "127.0.0.1:5002:5002"
     volumes:
       - cs-grep-data:/data
     restart: unless-stopped

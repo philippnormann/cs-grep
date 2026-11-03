@@ -1,13 +1,10 @@
 # syntax=docker/dockerfile:1
 # Stage 1: Build all Rust binaries
 FROM docker.io/library/rust:1-slim-bookworm AS rust-builder
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config libssl-dev ca-certificates sqlite3 \
-    && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rustfmt.toml ./
 COPY crates ./crates
-RUN cargo build --release -p cs-grep -p cs-grep-web
+RUN cargo build --locked --release -p cs-grep -p cs-grep-web
 
 # Stage 2: Runtime image with Rust binaries only
 FROM docker.io/library/debian:bookworm-slim AS runner
@@ -19,4 +16,4 @@ COPY --from=rust-builder /src/target/release/cs-grep /usr/local/bin/cs-grep
 COPY --from=rust-builder /src/target/release/cs-grep-web /usr/local/bin/cs-grep-web
 VOLUME ["/data"]
 EXPOSE 5002
-CMD ["cs-grep-web", "--host", "0.0.0.0", "--port", "5002", "--db", "/data/papers.db"]
+CMD ["cs-grep-web", "--host", "0.0.0.0", "--port", "5002", "--db", "/data/papers.db", "--config", "/data/config.yaml"]

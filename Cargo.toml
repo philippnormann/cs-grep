@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/cs-grep-core", "crates/cs-grep", "crates/cs-grep-web"]
+default-members = ["crates/cs-grep-core", "crates/cs-grep"]
 
 [workspace.package]
 version = "0.1.0"
