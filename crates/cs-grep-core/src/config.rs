@@ -209,6 +209,17 @@ impl Config {
         self.venues.iter().map(|v| v.id.clone()).collect()
     }
 
+    /// DBLP streams of the venues after `id` in config order. A paper listed
+    /// in several configured venues belongs to the last one.
+    pub fn later_streams(&self, id: &str) -> Vec<&str> {
+        self.venues
+            .iter()
+            .skip_while(|v| v.id != id)
+            .skip(1)
+            .map(|v| v.dblp_stream.as_str())
+            .collect()
+    }
+
     /// Venue ids matching the given rank labels (case-insensitive).
     pub fn venues_by_rank(&self, ranks: &[String]) -> Vec<String> {
         if ranks.is_empty() {
@@ -440,6 +451,18 @@ mod tests {
                 venue.id
             );
         }
+    }
+
+    #[test]
+    fn later_streams_follow_config_order() {
+        let mut cfg = Config::from_yaml("bundles: []\n").unwrap();
+        cfg.merge_venues(vec![
+            venue("A", "", &[]),
+            venue("B", "", &[]),
+            venue("C", "", &[]),
+        ]);
+        assert_eq!(cfg.later_streams("A"), ["conf/b", "conf/c"]);
+        assert!(cfg.later_streams("C").is_empty());
     }
 
     #[test]

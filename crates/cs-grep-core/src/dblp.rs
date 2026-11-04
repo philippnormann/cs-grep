@@ -10,9 +10,16 @@ use crate::{Error, Paper, Result};
 
 pub const DEFAULT_ENDPOINT: &str = "https://sparql.dblp.org/sparql";
 
-/// Build the SPARQL query for one DBLP venue stream from `min_year` on.
+/// Build the SPARQL query for one DBLP venue stream from `min_year` on, without
+/// papers also listed in one of the `later` streams (they belong there).
 /// One row per publication; authors are "ordinal\tname" lines.
-pub fn build_query(stream: &str, min_year: i32) -> String {
+pub fn build_query(stream: &str, min_year: i32, later: &[&str]) -> String {
+    // shortcut: each later stream adds ~55 bytes to the GET URL; past ~120 configured
+    // venues switch the DBLP request to POST (application/sparql-query)
+    let later: String = later
+        .iter()
+        .map(|s| format!(" <https://dblp.org/streams/{s}>"))
+        .collect();
     format!(
         r#"PREFIX dblp: <https://dblp.org/rdf/schema#>
 PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
@@ -30,6 +37,7 @@ SELECT ?publ (MIN(?title) AS ?t) (MIN(?year) AS ?y) (MIN(STR(?url)) AS ?u) (MIN(
   OPTIONAL {{ ?publ dblp:primaryDocumentPage ?url . }}
   OPTIONAL {{ ?publ dblp:doi ?doi . }}
   OPTIONAL {{ ?publ dblp:yearOfEvent ?eventYear . }}
+  FILTER NOT EXISTS {{ VALUES ?later {{{later} }} ?publ dblp:publishedInStream ?later }}
   BIND(COALESCE(?eventYear, ?pubYear) AS ?year)
   FILTER(?year >= "{min_year}"^^xsd:gYear)
 }}
@@ -138,9 +146,15 @@ impl Dblp {
         }
     }
 
-    /// Fetch and parse the papers of a venue from `min_year` on.
-    pub async fn fetch_venue(&self, venue: &Venue, min_year: i32) -> Result<Vec<Paper>> {
-        let query = build_query(&venue.dblp_stream, min_year);
+    /// Fetch and parse the papers of a venue from `min_year` on, except those
+    /// also listed in one of the `later` streams.
+    pub async fn fetch_venue(
+        &self,
+        venue: &Venue,
+        min_year: i32,
+        later: &[&str],
+    ) -> Result<Vec<Paper>> {
+        let query = build_query(&venue.dblp_stream, min_year, later);
         let resp = self
             .client
             .get(&self.endpoint)
@@ -183,17 +197,18 @@ mod tests {
     }
 
     #[test]
-    fn query_contains_stream_types_and_years() {
-        let q = build_query("conf/ndss", 2000);
+    fn query_contains_stream_types_years_and_later_streams() {
+        let q = build_query("conf/ndss", 2000, &["conf/soups"]);
         assert!(q.contains("https://dblp.org/streams/conf/ndss"));
         assert!(q.contains("VALUES ?type { dblp:Inproceedings dblp:Article }"));
         assert!(q.contains("\"2000\"^^xsd:gYear"));
         assert!(q.contains("GROUP_CONCAT(DISTINCT"));
+        assert!(q.contains("VALUES ?later { <https://dblp.org/streams/conf/soups> }"));
     }
 
     #[test]
     fn query_gives_event_year_precedence_over_publication_year() {
-        let q = build_query("conf/esorics", 2000);
+        let q = build_query("conf/esorics", 2000, &[]);
         assert!(q.contains("COALESCE(?eventYear, ?pubYear) AS ?year"));
     }
 

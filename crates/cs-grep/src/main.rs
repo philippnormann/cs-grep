@@ -324,7 +324,10 @@ async fn cmd_update(args: &UpdateArgs, cli: &Cli, paths: &Paths, config: &Config
         let safe_id = output::terminal_safe(id);
         eprint!("  {safe_id:<12} ");
         let _ = std::io::stderr().flush();
-        match dblp.fetch_venue(venue, min_year).await {
+        match dblp
+            .fetch_venue(venue, min_year, &config.later_streams(id))
+            .await
+        {
             Ok(papers) => {
                 let n = db.upsert_papers(&papers)?;
                 total += papers.len();

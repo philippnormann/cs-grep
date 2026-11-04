@@ -1,4 +1,6 @@
 # Software engineering venues bundled with cs-grep.
+# Order matters: a paper listed in several venues is stored under the last one,
+# so list workshops and co-located venues after their host.
 
 venues:
   - id: ICSE

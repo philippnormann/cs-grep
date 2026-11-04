@@ -165,7 +165,8 @@ cs-grep 'malware WHERE venue:DIMVA'
 ```
 
 `dblp_stream` is the DBLP stream id used by the RDF endpoint, such as
-`conf/dimva`.
+`conf/dimva`. A paper listed in several configured venues is stored under the
+last one.
 
 ## Abstracts
 
