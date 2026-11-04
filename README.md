@@ -183,6 +183,11 @@ older ones, or sooner when DBLP changes their title, DOI or URL. To retry all of
 them now, for example after adding an API key, run
 `sqlite3 <database> 'DELETE FROM abstract_misses'`.
 
+After an upgrade that changes the abstract rules, the next `enrich` re-checks
+stored abstracts once and repairs or clears those that no longer pass, so the
+cleared ones are fetched again. Back up the database first if you want to keep
+the old text.
+
 No API keys are required, but keys can improve rate limits and coverage.
 
 | Variable | Used for | Get a key |

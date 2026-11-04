@@ -35,6 +35,9 @@ const SEMANTIC_SCHOLAR_BATCH_SIZE: usize = 500;
 const OPENALEX_BATCH_SIZE: usize = 50;
 const TRANSIENT_RETRY_DELAY: Duration = Duration::from_millis(250);
 const STATIC_DNS_FAILED: &str = "static URL DNS lookup failed";
+/// Bump when sources, extractors or acceptance rules change: the next enrich
+/// re-checks stored abstracts and retries every remembered miss once.
+pub const ENRICH_VERSION: i32 = 1;
 const MIN_ABSTRACT_CHARS: usize = 80;
 const MAX_ABSTRACT_CHARS: usize = 6_000;
 
@@ -239,7 +242,7 @@ fn json_doi_title_matches(value: &Value, expected: &str) -> bool {
         .is_some_and(|title| doi_titles_match(title, expected))
 }
 
-fn usable_abstract_for_title(raw: String, title: &str) -> Option<String> {
+pub fn usable_abstract_for_title(raw: String, title: &str) -> Option<String> {
     let abstract_text = abstract_text(raw)?;
     (!titles_match(&abstract_text, title)).then_some(abstract_text)
 }
@@ -1599,6 +1602,8 @@ async fn read_body_limited(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // Changed a rule? Bump ENRICH_VERSION.
 
     fn paper(title: &str) -> Paper {
         Paper {

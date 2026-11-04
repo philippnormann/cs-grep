@@ -10,7 +10,7 @@ use std::{
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
-use cs_grep_core::abstracts::{EnrichResult, Enricher};
+use cs_grep_core::abstracts::{usable_abstract_for_title, EnrichResult, Enricher, ENRICH_VERSION};
 use cs_grep_core::config::{Config, Paths, Secrets};
 use cs_grep_core::db::{Database, Search, Sort};
 use cs_grep_core::dblp::Dblp;
@@ -380,11 +380,15 @@ async fn enrich_abstracts(
     limit: Option<usize>,
 ) -> Result<()> {
     let mut enricher = Enricher::new(Secrets::load());
+    let rechecked = db.begin_enrich_version(ENRICH_VERSION, usable_abstract_for_title)?;
     let pending = db.count_missing_abstracts(venue_ids, years)?;
     let total = limit.map_or(pending, |limit| limit.min(pending));
     let jobs = jobs.max(1);
     log_header("abstract enrichment");
     log_field("pending", format_args!("{pending} abstracts"));
+    if let Some(n) = rechecked {
+        log_field("rechecked", format_args!("{n} stored abstracts changed"));
+    }
     if !years.is_empty() {
         log_field("years", format_args!("{}", format_year_ranges(years)));
     }

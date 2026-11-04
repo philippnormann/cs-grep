@@ -9,6 +9,8 @@ use crate::config::RankSortOrder;
 use crate::query::{FilterExpr, YearRange};
 use crate::{Paper, Result};
 
+// shortcut: user_version holds ENRICH_VERSION; move both into a small meta table when a
+// non-additive schema change is needed.
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
@@ -221,6 +223,44 @@ impl Database {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// The first time `version` runs on this database: re-check every stored
+    /// abstract with `clean` (`None` clears it) and forget all remembered misses.
+    /// Returns the number of changed abstracts, or `None` if `version` already ran.
+    pub fn begin_enrich_version(
+        &mut self,
+        version: i32,
+        clean: impl Fn(String, &str) -> Option<String>,
+    ) -> Result<Option<usize>> {
+        let tx = self.conn.transaction()?;
+        let current: i32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if current >= version {
+            return Ok(None);
+        }
+        let mut changed = Vec::new();
+        {
+            let mut stmt =
+                tx.prepare("SELECT id, title, abstract FROM papers WHERE abstract <> ''")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let old: String = row.get(2)?;
+                let new = clean(old.clone(), &row.get::<_, String>(1)?);
+                if new.as_ref() != Some(&old) {
+                    changed.push((row.get::<_, i64>(0)?, new));
+                }
+            }
+            let mut stmt = tx.prepare(
+                "UPDATE papers SET abstract = ?2, updated_at = datetime('now') WHERE id = ?1",
+            )?;
+            for (id, abstract_text) in &changed {
+                stmt.execute(rusqlite::params![id, abstract_text])?;
+            }
+        }
+        tx.execute("DELETE FROM abstract_misses", [])?;
+        tx.pragma_update(None, "user_version", version)?;
+        tx.commit()?;
+        Ok(Some(changed.len()))
     }
 
     pub fn papers_missing_abstract_batch(
@@ -959,5 +999,34 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].dblp_key, "k2");
+    }
+
+    #[test]
+    fn begin_enrich_version_rechecks_stored_abstracts_once() {
+        let mut db = seeded();
+        let clean =
+            |abs: String, _: &str| (abs != "rop chains").then(|| abs.replace("fuzz", "test"));
+        db.record_abstract_misses(&["k2".to_string()]).unwrap();
+        assert_eq!(db.count_missing_abstracts(&[], &[]).unwrap(), 0);
+        assert_eq!(db.begin_enrich_version(1, clean).unwrap(), Some(2));
+        assert_eq!(
+            paper_by_key(&db, "k1").abstract_text.as_deref(),
+            Some("we test kernels")
+        );
+        assert_eq!(paper_by_key(&db, "k3").abstract_text, None);
+        assert_eq!(db.count_missing_abstracts(&[], &[]).unwrap(), 2);
+        assert!(db
+            .search(&Search {
+                fts: Some("rop".into()),
+                ..Default::default()
+            })
+            .unwrap()
+            .is_empty());
+        let misses: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM abstract_misses", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(misses, 0);
+        assert_eq!(db.begin_enrich_version(1, clean).unwrap(), None);
     }
 }
