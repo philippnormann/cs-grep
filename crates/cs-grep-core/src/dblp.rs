@@ -1,46 +1,40 @@
-//! dblp SPARQL ingestion: fetch inproceedings for a venue stream.
+//! dblp SPARQL ingestion: fetch the papers of a venue stream.
 
-use std::{collections::BTreeMap, time::Duration};
+use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::abstracts::{collapse_ws, decode_html_entities};
 use crate::config::Venue;
 use crate::{Error, Paper, Result};
 
 pub const DEFAULT_ENDPOINT: &str = "https://sparql.dblp.org/sparql";
-const CONFERENCE_STREAM_PREFIX: &str = "conf/";
-const JOURNAL_STREAM_PREFIX: &str = "journals/";
 
-/// Build the SPARQL query for a single DBLP venue stream, bounded by year.
-pub fn build_query(stream: &str, min_year: i32, max_year: i32) -> Result<String> {
-    let publ_type = if stream.starts_with(CONFERENCE_STREAM_PREFIX) {
-        "Inproceedings"
-    } else if stream.starts_with(JOURNAL_STREAM_PREFIX) {
-        "Article"
-    } else {
-        return Err(Error::Config(format!(
-            "unsupported DBLP stream `{stream}`; expected `{CONFERENCE_STREAM_PREFIX}...` or `{JOURNAL_STREAM_PREFIX}...`"
-        )));
-    };
-    Ok(format!(
+/// Build the SPARQL query for one DBLP venue stream from `min_year` on.
+/// One row per publication; authors are "ordinal\tname" lines.
+pub fn build_query(stream: &str, min_year: i32) -> String {
+    format!(
         r#"PREFIX dblp: <https://dblp.org/rdf/schema#>
 PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
-SELECT ?publ ?title ?year ?ordinal ?author ?url WHERE {{
+SELECT ?publ (MIN(?title) AS ?t) (MIN(?year) AS ?y) (MIN(STR(?url)) AS ?u) (MIN(STR(?doi)) AS ?d)
+       (GROUP_CONCAT(DISTINCT CONCAT(STR(?ordinal), "\t", ?author); SEPARATOR="\n") AS ?a) WHERE {{
+  VALUES ?type {{ dblp:Inproceedings dblp:Article }}
   ?publ dblp:publishedInStream <https://dblp.org/streams/{stream}> ;
-        rdf:type dblp:{publ_type} ;
+        rdf:type ?type ;
         dblp:title ?title ;
         dblp:yearOfPublication ?pubYear ;
         dblp:hasSignature ?sig .
   ?sig dblp:signatureDblpName ?author ;
        dblp:signatureOrdinal ?ordinal .
   OPTIONAL {{ ?publ dblp:primaryDocumentPage ?url . }}
+  OPTIONAL {{ ?publ dblp:doi ?doi . }}
   OPTIONAL {{ ?publ dblp:yearOfEvent ?eventYear . }}
   BIND(COALESCE(?eventYear, ?pubYear) AS ?year)
-  FILTER(?year >= "{min_year}"^^xsd:gYear && ?year <= "{max_year}"^^xsd:gYear)
+  FILTER(?year >= "{min_year}"^^xsd:gYear)
 }}
-ORDER BY ?publ xsd:integer(?ordinal)"#,
-    ))
+GROUP BY ?publ"#,
+    )
 }
 
 /// dblp disambiguates homonyms with a trailing 4-digit id ("Name 0001");
@@ -73,65 +67,49 @@ fn binding_str<'a>(binding: &'a Value, key: &str) -> Option<&'a str> {
     binding.get(key)?.get("value")?.as_str()
 }
 
-/// Parse a SPARQL JSON results document into deduplicated papers for a venue.
-pub fn parse_results(json: &Value, venue_id: &str) -> Vec<Paper> {
-    // Preserve first-seen ordering of publications.
-    let mut order: Vec<String> = Vec::new();
-    let mut by_publ: BTreeMap<String, (Paper, Vec<(i64, String)>)> = BTreeMap::new();
-
+/// Parse a SPARQL JSON results document into papers for a venue.
+pub fn parse_results(json: &Value, venue_id: &str) -> Result<Vec<Paper>> {
     let bindings = json
         .get("results")
         .and_then(|r| r.get("bindings"))
         .and_then(|b| b.as_array())
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-
-    for b in bindings {
-        let Some(publ) = binding_str(b, "publ") else {
-            continue;
-        };
-        let entry = by_publ.entry(publ.to_string()).or_insert_with(|| {
-            order.push(publ.to_string());
-            let title = binding_str(b, "title").unwrap_or_default().to_string();
-            let year = binding_str(b, "year")
-                .and_then(|y| y.parse::<i32>().ok())
-                .unwrap_or(0);
-            let url = binding_str(b, "url").map(|s| s.to_string());
-            let doi = url.as_deref().and_then(extract_doi);
-            (
-                Paper {
-                    dblp_key: publ.to_string(),
-                    venue: venue_id.to_string(),
-                    year,
-                    title,
-                    authors: String::new(),
-                    doi,
-                    url,
-                    abstract_text: None,
-                },
-                Vec::new(),
-            )
-        });
-        if let (Some(author), Some(ordinal)) = (binding_str(b, "author"), binding_str(b, "ordinal"))
-        {
-            let ord = ordinal.parse::<i64>().unwrap_or(i64::MAX);
-            entry.1.push((ord, clean_author(author)));
-        }
-    }
-
-    order
-        .into_iter()
-        .filter_map(|k| by_publ.remove(&k))
-        .map(|(mut paper, mut authors)| {
-            authors.sort_by_key(|(ord, _)| *ord);
-            paper.authors = authors
-                .into_iter()
-                .map(|(_, a)| a)
-                .collect::<Vec<_>>()
-                .join(", ");
-            paper
+        .ok_or_else(|| Error::Other("dblp response has no results.bindings".into()))?;
+    Ok(bindings
+        .iter()
+        .filter_map(|b| {
+            let publ = binding_str(b, "publ")?;
+            let url = binding_str(b, "u").map(str::to_string);
+            let doi = url
+                .as_deref()
+                .and_then(extract_doi)
+                .or_else(|| binding_str(b, "d").and_then(extract_doi));
+            let mut authors: Vec<(i64, &str)> = binding_str(b, "a")
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| l.split_once('\t'))
+                .map(|(o, a)| (o.parse().unwrap_or(i64::MAX), a))
+                .collect();
+            authors.sort_unstable();
+            Some(Paper {
+                dblp_key: publ.to_string(),
+                venue: venue_id.to_string(),
+                year: binding_str(b, "y")
+                    .and_then(|y| y.parse().ok())
+                    .unwrap_or(0),
+                title: collapse_ws(&decode_html_entities(
+                    binding_str(b, "t").unwrap_or_default(),
+                )),
+                authors: authors
+                    .into_iter()
+                    .map(|(_, a)| clean_author(a))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                doi,
+                url,
+                abstract_text: None,
+            })
         })
-        .collect()
+        .collect())
 }
 
 /// SPARQL client over the dblp endpoint.
@@ -160,14 +138,9 @@ impl Dblp {
         }
     }
 
-    /// Fetch and parse all papers for a venue between the given years.
-    pub async fn fetch_venue(
-        &self,
-        venue: &Venue,
-        min_year: i32,
-        max_year: i32,
-    ) -> Result<Vec<Paper>> {
-        let query = build_query(&venue.dblp_stream, min_year, max_year)?;
+    /// Fetch and parse the papers of a venue from `min_year` on.
+    pub async fn fetch_venue(&self, venue: &Venue, min_year: i32) -> Result<Vec<Paper>> {
+        let query = build_query(&venue.dblp_stream, min_year);
         let resp = self
             .client
             .get(&self.endpoint)
@@ -177,7 +150,7 @@ impl Dblp {
             .await?
             .error_for_status()?;
         let json: Value = resp.json().await?;
-        Ok(parse_results(&json, &venue.id))
+        parse_results(&json, &venue.id)
     }
 }
 
@@ -190,48 +163,38 @@ mod tests {
         publ: &str,
         title: &str,
         year: &str,
-        ord: &str,
-        author: &str,
+        authors: &str,
         url: Option<&str>,
+        doi: Option<&str>,
     ) -> Value {
         let mut b = json!({
             "publ": {"value": publ},
-            "title": {"value": title},
-            "year": {"value": year},
-            "ordinal": {"value": ord},
-            "author": {"value": author},
+            "t": {"value": title},
+            "y": {"value": year},
+            "a": {"value": authors},
         });
         if let Some(u) = url {
-            b["url"] = json!({"value": u});
+            b["u"] = json!({"value": u});
+        }
+        if let Some(d) = doi {
+            b["d"] = json!({"value": d});
         }
         b
     }
 
     #[test]
-    fn query_contains_stream_and_years() {
-        let q = build_query("conf/ndss", 2000, 2025).unwrap();
+    fn query_contains_stream_types_and_years() {
+        let q = build_query("conf/ndss", 2000);
         assert!(q.contains("https://dblp.org/streams/conf/ndss"));
-        assert!(q.contains("rdf:type dblp:Inproceedings"));
+        assert!(q.contains("VALUES ?type { dblp:Inproceedings dblp:Article }"));
         assert!(q.contains("\"2000\"^^xsd:gYear"));
-        assert!(q.contains("\"2025\"^^xsd:gYear"));
+        assert!(q.contains("GROUP_CONCAT(DISTINCT"));
     }
 
     #[test]
     fn query_gives_event_year_precedence_over_publication_year() {
-        let q = build_query("conf/esorics", 2000, 2025).unwrap();
+        let q = build_query("conf/esorics", 2000);
         assert!(q.contains("COALESCE(?eventYear, ?pubYear) AS ?year"));
-    }
-
-    #[test]
-    fn query_infers_article_type_for_journal_streams() {
-        let q = build_query("journals/tops", 2000, 2025).unwrap();
-        assert!(q.contains("https://dblp.org/streams/journals/tops"));
-        assert!(q.contains("rdf:type dblp:Article"));
-    }
-
-    #[test]
-    fn query_rejects_unsupported_stream_prefixes() {
-        assert!(build_query("series/example", 2000, 2025).is_err());
     }
 
     #[test]
@@ -255,29 +218,42 @@ mod tests {
     }
 
     #[test]
-    fn parse_groups_authors_by_ordinal() {
-        let doc = json!({
-            "results": {"bindings": [
-                binding("p1", "Title One", "2020", "2", "Bob B", Some("https://doi.org/10.1/a")),
-                binding("p1", "Title One", "2020", "1", "Alice A 0001", Some("https://doi.org/10.1/a")),
-                binding("p2", "Title Two", "2021", "1", "Carol C", None),
-            ]}
-        });
-        let papers = parse_results(&doc, "NDSS");
+    fn parse_sorts_authors_by_ordinal() {
+        let doc = json!({"results": {"bindings": [
+            binding("p1", "Title One", "2020", "2\tBob B\n10\tDan D\n1\tAlice A 0001", Some("https://doi.org/10.1/a"), None),
+            binding("p2", "Title Two", "2021", "1\tCarol C", None, None),
+        ]}});
+        let papers = parse_results(&doc, "NDSS").unwrap();
         assert_eq!(papers.len(), 2);
-        let p1 = papers.iter().find(|p| p.dblp_key == "p1").unwrap();
-        assert_eq!(p1.authors, "Alice A, Bob B");
-        assert_eq!(p1.venue, "NDSS");
-        assert_eq!(p1.year, 2020);
-        assert_eq!(p1.doi.as_deref(), Some("10.1/a"));
-        let p2 = papers.iter().find(|p| p.dblp_key == "p2").unwrap();
-        assert_eq!(p2.authors, "Carol C");
-        assert!(p2.url.is_none());
+        assert_eq!(papers[0].authors, "Alice A, Bob B, Dan D");
+        assert_eq!(papers[0].venue, "NDSS");
+        assert_eq!(papers[0].year, 2020);
+        assert_eq!(papers[0].doi.as_deref(), Some("10.1/a"));
+        assert_eq!(papers[1].authors, "Carol C");
+        assert!(papers[1].url.is_none());
+    }
+
+    #[test]
+    fn parse_prefers_url_doi_over_dblp_doi() {
+        let doc = json!({"results": {"bindings": [
+            binding("p1", "T", "2020", "1\tA", Some("https://doi.org/10.1145/x"), Some("https://doi.org/10.1109/y")),
+            binding("p2", "T", "2020", "1\tA", Some("https://openaccess.thecvf.com/x.html"), Some("https://doi.org/10.1109/y")),
+        ]}});
+        let papers = parse_results(&doc, "NDSS").unwrap();
+        assert_eq!(papers[0].doi.as_deref(), Some("10.1145/x"));
+        assert_eq!(papers[1].doi.as_deref(), Some("10.1109/y"));
+    }
+
+    #[test]
+    fn parse_cleans_title_entities_and_whitespace() {
+        let doc = json!({"results": {"bindings": [binding("p1", "A &amp; B  C", "2020", "1\tA", None, None)]}});
+        assert_eq!(parse_results(&doc, "NDSS").unwrap()[0].title, "A & B C");
     }
 
     #[test]
     fn parse_empty_results() {
         let doc = json!({"results": {"bindings": []}});
-        assert!(parse_results(&doc, "NDSS").is_empty());
+        assert!(parse_results(&doc, "NDSS").unwrap().is_empty());
+        assert!(parse_results(&json!({}), "NDSS").is_err());
     }
 }

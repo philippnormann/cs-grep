@@ -327,7 +327,7 @@ fn crossref_title_matches(message: &Value, expected: &str) -> bool {
         .is_some_and(|title| doi_titles_match(title, expected))
 }
 
-fn collapse_ws(s: &str) -> String {
+pub(crate) fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -580,7 +580,7 @@ fn static_page_title_matches(html: &str, paper: &Paper) -> bool {
         && doi_titles_match(title, &paper.title)
 }
 
-fn decode_html_entities(s: &str) -> String {
+pub(crate) fn decode_html_entities(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
 

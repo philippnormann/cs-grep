@@ -18,9 +18,6 @@ use cs_grep_core::output::{self, Column, Format};
 use cs_grep_core::query;
 use cs_grep_core::Paper;
 
-/// Upper bound for dblp year filters; papers never exceed this.
-const MAX_YEAR: i32 = 2100;
-
 #[derive(Parser)]
 #[command(
     name = "cs-grep",
@@ -327,7 +324,7 @@ async fn cmd_update(args: &UpdateArgs, cli: &Cli, paths: &Paths, config: &Config
         let safe_id = output::terminal_safe(id);
         eprint!("  {safe_id:<12} ");
         let _ = std::io::stderr().flush();
-        match dblp.fetch_venue(venue, min_year, MAX_YEAR).await {
+        match dblp.fetch_venue(venue, min_year).await {
             Ok(papers) => {
                 let n = db.upsert_papers(&papers)?;
                 total += papers.len();

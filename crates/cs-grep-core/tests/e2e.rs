@@ -7,22 +7,20 @@ use cs_grep_core::{dblp, query};
 use serde_json::json;
 
 fn fixture() -> serde_json::Value {
-    let row = |publ: &str, title: &str, year: &str, ord: &str, author: &str, url: &str| {
+    let row = |publ: &str, title: &str, year: &str, authors: &str, url: &str| {
         json!({
             "publ": {"value": publ},
-            "title": {"value": title},
-            "year": {"value": year},
-            "ordinal": {"value": ord},
-            "author": {"value": author},
-            "url": {"value": url},
+            "t": {"value": title},
+            "y": {"value": year},
+            "a": {"value": authors},
+            "u": {"value": url},
         })
     };
     json!({
         "results": {"bindings": [
-            row("p1", "Fuzzing the Linux kernel", "2024", "1", "Alice Smith 0001", "https://doi.org/10.1/a"),
-            row("p1", "Fuzzing the Linux kernel", "2024", "2", "Bob Jones", "https://doi.org/10.1/a"),
-            row("p2", "Side channel attacks on caches", "2023", "1", "Carol Chen", "https://doi.org/10.1/b"),
-            row("p3", "A formal model of TLS", "2022", "1", "Dave Diaz", "https://doi.org/10.1/c"),
+            row("p1", "Fuzzing the Linux kernel", "2024", "1\tAlice Smith 0001\n2\tBob Jones", "https://doi.org/10.1/a"),
+            row("p2", "Side channel attacks on caches", "2023", "1\tCarol Chen", "https://doi.org/10.1/b"),
+            row("p3", "A formal model of TLS", "2022", "1\tDave Diaz", "https://doi.org/10.1/c"),
         ]}
     })
 }
@@ -30,7 +28,7 @@ fn fixture() -> serde_json::Value {
 #[test]
 fn full_pipeline() {
     // ingest
-    let papers = dblp::parse_results(&fixture(), "NDSS");
+    let papers = dblp::parse_results(&fixture(), "NDSS").unwrap();
     assert_eq!(papers.len(), 3);
     let mut db = Database::open_in_memory().unwrap();
     let n = db.upsert_papers(&papers).unwrap();
