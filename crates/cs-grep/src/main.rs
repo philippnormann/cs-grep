@@ -85,7 +85,6 @@ enum Command {
 /// Default number of concurrent abstract fetches.
 const DEFAULT_JOBS: usize = 8;
 const ENRICH_BATCH_SIZE: usize = 500;
-const ENRICH_PROGRESS_INTERVAL: usize = 500;
 
 #[derive(clap::Args)]
 struct UpdateArgs {
@@ -398,6 +397,7 @@ async fn enrich_abstracts(
     let mut filled = 0usize;
     let mut processed = 0usize;
     let mut misses: BTreeMap<String, usize> = BTreeMap::new();
+    let mut transient: BTreeMap<String, usize> = BTreeMap::new();
     let mut after_id = 0;
     while processed < total {
         let remaining = total - processed;
@@ -431,6 +431,7 @@ async fn enrich_abstracts(
         let results = enricher.enrich_many(papers, jobs).await;
 
         let mut abstract_updates = Vec::new();
+        let mut batch_misses = Vec::new();
         for (paper, res) in results {
             processed += 1;
             let dblp_key = paper.dblp_key;
@@ -441,21 +442,10 @@ async fn enrich_abstracts(
                 }
                 Ok(EnrichResult::Missing(reason)) => {
                     *misses.entry(reason).or_default() += 1;
+                    batch_misses.push(dblp_key);
                 }
-                Err(e) => {
-                    let error = e.to_string();
-                    eprintln!(
-                        "warning: abstract fetch failed for {}: {}",
-                        output::terminal_safe(&dblp_key),
-                        output::terminal_safe(&error)
-                    );
-                }
-            }
-            if processed.is_multiple_of(ENRICH_PROGRESS_INTERVAL) {
-                log_field(
-                    "progress",
-                    format_args!("{processed}/{total} processed, {filled} filled"),
-                );
+                // Not remembered, so the next run tries the paper again.
+                Err(e) => *transient.entry(e.to_string()).or_default() += 1,
             }
         }
         log_field(
@@ -463,17 +453,21 @@ async fn enrich_abstracts(
             format_args!(
                 "{} filled, {} missed",
                 abstract_updates.len(),
-                batch_len - abstract_updates.len()
+                batch_misses.len()
             ),
         );
         db.set_abstracts(&abstract_updates)?;
+        db.record_abstract_misses(&batch_misses)?;
     }
     log_blank();
     log_header("summary");
     log_field("filled", format_args!("{filled}/{processed} abstracts"));
-    if !misses.is_empty() {
-        log_field("missed", processed - filled);
-        for (reason, count) in misses {
+    for (label, reasons) in [("missed", misses), ("transient", transient)] {
+        if reasons.is_empty() {
+            continue;
+        }
+        log_field(label, reasons.values().sum::<usize>());
+        for (reason, count) in reasons {
             eprintln!("  {count:>10} {}", output::terminal_safe(&reason));
         }
     }

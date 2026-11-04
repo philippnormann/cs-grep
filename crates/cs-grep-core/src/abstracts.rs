@@ -32,8 +32,9 @@ const OPENREVIEW_LOGIN_EXPIRES_IN: u64 = 7 * 24 * 60 * 60;
 const OPENREVIEW_API_V1: usize = 0;
 const OPENREVIEW_API_V2: usize = 1;
 const SEMANTIC_SCHOLAR_BATCH_SIZE: usize = 500;
-const OPENALEX_BATCH_SIZE: usize = 100;
+const OPENALEX_BATCH_SIZE: usize = 50;
 const TRANSIENT_RETRY_DELAY: Duration = Duration::from_millis(250);
+const STATIC_DNS_FAILED: &str = "static URL DNS lookup failed";
 const MIN_ABSTRACT_CHARS: usize = 80;
 const MAX_ABSTRACT_CHARS: usize = 6_000;
 
@@ -626,6 +627,8 @@ pub struct Enricher {
     client: reqwest::Client,
     secrets: Secrets,
     openreview_cache: HashMap<String, String>,
+    /// Forum ids whose OpenReview batch failed transiently.
+    openreview_unanswered: HashSet<String>,
     doi_cache: HashMap<String, Option<String>>,
     openreview_login_tokens: [OnceLock<String>; 2],
 }
@@ -635,10 +638,34 @@ pub enum EnrichResult {
     Missing(String),
 }
 
-#[derive(Clone, Copy)]
-enum RateLimitRetry {
-    Enabled,
-    Disabled,
+/// A failed API request. Rate limits, server and network errors are
+/// `transient`: the paper is retried in a later run instead of remembered as a miss.
+#[derive(Debug)]
+struct FetchError {
+    reason: String,
+    transient: bool,
+}
+
+impl FetchError {
+    fn new(reason: impl Into<String>, transient: bool) -> Self {
+        let reason = reason.into();
+        Self { reason, transient }
+    }
+}
+
+/// The response, or `None` after noting a transient failure from `source` in `transient`.
+fn ok_or_note(
+    source: &str,
+    result: std::result::Result<Value, FetchError>,
+    transient: &mut Option<String>,
+) -> Option<Value> {
+    result
+        .map_err(|e| {
+            if e.transient {
+                transient.get_or_insert_with(|| format!("{source} {}", e.reason));
+            }
+        })
+        .ok()
 }
 
 fn store_doi_batch_results(
@@ -677,11 +704,14 @@ impl Enricher {
             client,
             secrets,
             openreview_cache: HashMap::new(),
+            openreview_unanswered: HashSet::new(),
             doi_cache: HashMap::new(),
             openreview_login_tokens: [OnceLock::new(), OnceLock::new()],
         }
     }
 
+    /// `Err` means a source did not answer; retry the paper later. `Missing`
+    /// means every source answered without an abstract.
     pub async fn enrich_many(
         &mut self,
         inputs: Vec<Paper>,
@@ -719,6 +749,7 @@ impl Enricher {
         }
         for ids in needed.chunks(OPENREVIEW_BATCH_SIZE) {
             let mut missing = ids.to_vec();
+            let mut transient = false;
             for base in [
                 "https://api2.openreview.net/notes",
                 "https://api.openreview.net/notes",
@@ -726,9 +757,10 @@ impl Enricher {
                 match self.openreview_abstracts_from(base, &missing).await {
                     Ok(abstracts) => self.openreview_cache.extend(abstracts),
                     Err(e) => {
+                        transient |= e.transient;
                         eprintln!(
                             "warning: OpenReview batch lookup failed for {base}: {}",
-                            terminal_safe(&e.to_string())
+                            terminal_safe(&e.reason)
                         );
                     }
                 }
@@ -736,6 +768,9 @@ impl Enricher {
                 if missing.is_empty() {
                     break;
                 }
+            }
+            if transient {
+                self.openreview_unanswered.extend(missing);
             }
         }
     }
@@ -764,10 +799,9 @@ impl Enricher {
             {
                 Ok(hits) => hits,
                 Err(e) => {
-                    let error = e.to_string();
                     eprintln!(
                         "warning: Semantic Scholar DOI batch lookup failed: {}",
-                        terminal_safe(&error)
+                        terminal_safe(&e.reason)
                     );
                     HashMap::new()
                 }
@@ -781,10 +815,9 @@ impl Enricher {
                 match self.openalex_doi_abstracts(missing, &expected_titles).await {
                     Ok(openalex_hits) => hits.extend(openalex_hits),
                     Err(e) => {
-                        let error = e.to_string();
                         eprintln!(
                             "warning: OpenAlex DOI batch lookup failed: {}",
-                            terminal_safe(&error)
+                            terminal_safe(&e.reason)
                         );
                         retry_individually.extend(missing.iter().cloned());
                     }
@@ -795,19 +828,28 @@ impl Enricher {
     }
 
     async fn enrich_after_prefetch(&self, paper: &Paper) -> Result<EnrichResult> {
-        if let Some(abs) = self.api_by_doi(paper).await? {
+        let mut transient = paper
+            .url
+            .as_deref()
+            .and_then(openreview_forum_id)
+            .filter(|id| self.openreview_unanswered.contains(id))
+            .map(|_| "OpenReview batch failed".to_string());
+        if let Some(abs) = self.api_by_doi(paper, &mut transient).await {
             return Ok(EnrichResult::Found(abs));
         }
-        self.fallback_enrich(paper).await
+        match (self.fallback_enrich(paper, &mut transient).await, transient) {
+            (EnrichResult::Missing(_), Some(reason)) => Err(crate::Error::Other(reason)),
+            (result, _) => Ok(result),
+        }
     }
 
-    async fn fallback_enrich(&self, paper: &Paper) -> Result<EnrichResult> {
+    async fn fallback_enrich(&self, paper: &Paper, transient: &mut Option<String>) -> EnrichResult {
         let source = paper_source(paper);
         let mut static_miss = None;
         if source.is_some_and(|source| source != AbstractSource::Openreview) && paper.url.is_some()
         {
-            match self.static_scrape(paper, source).await? {
-                EnrichResult::Found(abs) => return Ok(EnrichResult::Found(abs)),
+            match self.static_scrape(paper, source, transient).await {
+                EnrichResult::Found(abs) => return EnrichResult::Found(abs),
                 EnrichResult::Missing(reason) => {
                     static_miss = Some(reason);
                 }
@@ -815,65 +857,63 @@ impl Enricher {
         }
 
         if paper.doi.as_deref().and_then(normalized_doi).is_none() {
-            if let Some(abs) = self.api_by_title(paper).await? {
-                return Ok(EnrichResult::Found(abs));
+            if let Some(abs) = self.api_by_title(paper, transient).await {
+                return EnrichResult::Found(abs);
             }
         }
         if let Some(reason) = static_miss {
-            return Ok(EnrichResult::Missing(reason));
+            return EnrichResult::Missing(reason);
         }
         if paper.url.is_some() {
-            return self.static_scrape(paper, source).await;
+            return self.static_scrape(paper, source, transient).await;
         }
-        Ok(EnrichResult::Missing(
-            "API metadata lookup missed and paper has no URL".into(),
-        ))
+        EnrichResult::Missing("API metadata lookup missed and paper has no URL".into())
     }
 
-    async fn api_by_doi(&self, paper: &Paper) -> Result<Option<String>> {
-        let Some(doi) = paper.doi.as_deref().and_then(normalized_doi) else {
-            return Ok(None);
-        };
+    async fn api_by_doi(&self, paper: &Paper, transient: &mut Option<String>) -> Option<String> {
+        let doi = paper.doi.as_deref().and_then(normalized_doi)?;
         if !self.doi_cache.contains_key(&doi) {
-            if let Some(abs) = self
-                .fetch_openalex_json(&format!("https://api.openalex.org/works/doi:{doi}"), &[])
-                .await
-                .ok()
-                .filter(|json| json_doi_title_matches(json, &paper.title))
-                .and_then(|json| abstract_from_openalex(&json))
-                .and_then(|abs| usable_abstract_for_title(abs, &paper.title))
+            if let Some(abs) = ok_or_note(
+                "OpenAlex",
+                self.fetch_openalex_json(&format!("https://api.openalex.org/works/doi:{doi}"), &[])
+                    .await,
+                transient,
+            )
+            .filter(|json| json_doi_title_matches(json, &paper.title))
+            .and_then(|json| abstract_from_openalex(&json))
+            .and_then(|abs| usable_abstract_for_title(abs, &paper.title))
             {
-                return Ok(Some(abs));
+                return Some(abs);
             }
         }
 
         let cr = self
             .client
             .get(format!("https://api.crossref.org/works/{doi}"));
-        Ok(self
-            .fetch_json(cr, RateLimitRetry::Enabled)
-            .await
-            .ok()
+        ok_or_note("Crossref", self.fetch_json(cr).await, transient)
             .and_then(|json| json.get("message").cloned())
             .filter(|message| crossref_title_matches(message, &paper.title))
             .and_then(|message| abstract_from_crossref(&message))
-            .and_then(|abs| usable_abstract_for_title(abs, &paper.title)))
+            .and_then(|abs| usable_abstract_for_title(abs, &paper.title))
     }
 
     async fn openalex_doi_abstracts(
         &self,
         dois: &[String],
         expected_titles: &HashMap<String, String>,
-    ) -> Result<HashMap<String, String>> {
+    ) -> std::result::Result<HashMap<String, String>, FetchError> {
         let filter = format!("doi:{}", dois.join("|"));
-        let per_page = dois.len().to_string();
         let json = self
             .fetch_openalex_json(
                 "https://api.openalex.org/works",
-                &[("filter", filter.as_str()), ("per-page", per_page.as_str())],
+                &[
+                    ("filter", filter.as_str()),
+                    ("select", "doi,title,abstract_inverted_index"),
+                    // above the batch size: one DOI can match several works; OpenAlex caps it at 100
+                    ("per-page", "100"),
+                ],
             )
-            .await
-            .map_err(crate::Error::Other)?;
+            .await?;
         Ok(abstracts_from_openalex_works(&json, expected_titles))
     }
 
@@ -881,7 +921,7 @@ impl Enricher {
         &self,
         dois: &[String],
         expected_titles: &HashMap<String, String>,
-    ) -> Result<HashMap<String, String>> {
+    ) -> std::result::Result<HashMap<String, String>, FetchError> {
         let ids = dois
             .iter()
             .map(|doi| format!("DOI:{doi}"))
@@ -891,28 +931,27 @@ impl Enricher {
             .post("https://api.semanticscholar.org/graph/v1/paper/batch")
             .query(&[("fields", "externalIds,title,abstract")])
             .json(&serde_json::json!({ "ids": ids }));
-        let json = self
-            .fetch_semantic_scholar_json(req)
-            .await
-            .map_err(crate::Error::Other)?;
+        let json = self.fetch_semantic_scholar_json(req).await?;
         Ok(abstracts_from_semantic_scholar_batch(
             &json,
             expected_titles,
         ))
     }
 
-    async fn api_by_title(&self, paper: &Paper) -> Result<Option<String>> {
-        if let Some(abs) = self
-            .fetch_openalex_json(
+    async fn api_by_title(&self, paper: &Paper, transient: &mut Option<String>) -> Option<String> {
+        if let Some(abs) = ok_or_note(
+            "OpenAlex",
+            self.fetch_openalex_json(
                 "https://api.openalex.org/works",
                 &[("search", paper.title.as_str()), ("per-page", "10")],
             )
-            .await
-            .ok()
-            .and_then(|json| abstract_from_openalex_title_search(&json, paper))
-            .and_then(|abs| usable_abstract_for_title(abs, &paper.title))
+            .await,
+            transient,
+        )
+        .and_then(|json| abstract_from_openalex_title_search(&json, paper))
+        .and_then(|abs| usable_abstract_for_title(abs, &paper.title))
         {
-            return Ok(Some(abs));
+            return Some(abs);
         }
 
         let s2_req = self
@@ -923,28 +962,25 @@ impl Enricher {
                 ("limit", "5"),
                 ("fields", "title,year,authors,abstract"),
             ]);
-        Ok(self
-            .fetch_semantic_scholar_json(s2_req)
+        // Semantic Scholar is best-effort: keyless it is rate limited most of the time.
+        self.fetch_semantic_scholar_json(s2_req)
             .await
             .ok()
             .and_then(|json| abstract_from_semantic_scholar_title_search(&json, paper))
-            .and_then(|abs| usable_abstract_for_title(abs, &paper.title)))
+            .and_then(|abs| usable_abstract_for_title(abs, &paper.title))
     }
 
     async fn openreview_abstracts_from(
         &self,
         base: &str,
         ids: &[String],
-    ) -> Result<HashMap<String, String>> {
+    ) -> std::result::Result<HashMap<String, String>, FetchError> {
         let req = self.openreview_get(base).await.query(&[
             ("ids", ids.join(",")),
             ("limit", ids.len().to_string()),
             ("select", "id,forum,content.abstract".to_string()),
         ]);
-        let json = self
-            .fetch_json(req, RateLimitRetry::Enabled)
-            .await
-            .map_err(crate::Error::Other)?;
+        let json = self.fetch_json(req).await?;
         let mut abstracts = abstracts_from_openreview_notes(&json);
         Ok(ids
             .iter()
@@ -983,7 +1019,7 @@ impl Enricher {
             "password": password,
             "expiresIn": OPENREVIEW_LOGIN_EXPIRES_IN,
         }));
-        let json = self.fetch_json(req, RateLimitRetry::Disabled).await.ok()?;
+        let json = self.fetch_json(req).await.ok()?;
         json.get("token")
             .and_then(|token| token.as_str())
             .map(str::to_string)
@@ -993,18 +1029,18 @@ impl Enricher {
         &self,
         url: &str,
         query: &[(&str, &str)],
-    ) -> std::result::Result<Value, String> {
+    ) -> std::result::Result<Value, FetchError> {
         let plain_req = || self.client.get(url).query(query);
         let req = match &self.secrets.openalex_api_key {
             Some(key) => plain_req().query(&[("api_key", key.as_str())]),
             None => plain_req(),
         };
-        match self.fetch_json(req, RateLimitRetry::Disabled).await {
-            Err(reason)
+        match self.fetch_json(req).await {
+            Err(e)
                 if self.secrets.openalex_api_key.is_some()
-                    && should_retry_without_api_key(&reason) =>
+                    && should_retry_without_api_key(&e.reason) =>
             {
-                self.fetch_json(plain_req(), RateLimitRetry::Disabled).await
+                self.fetch_json(plain_req()).await
             }
             other => other,
         }
@@ -1013,43 +1049,44 @@ impl Enricher {
     async fn fetch_semantic_scholar_json(
         &self,
         plain_req: reqwest::RequestBuilder,
-    ) -> std::result::Result<Value, String> {
+    ) -> std::result::Result<Value, FetchError> {
         let Some(key) = &self.secrets.semantic_scholar_key else {
-            return self.fetch_json(plain_req, RateLimitRetry::Enabled).await;
+            return self.fetch_json(plain_req).await;
         };
         let fallback = plain_req.try_clone();
         let req = plain_req.header("x-api-key", key);
-        match self.fetch_json(req, RateLimitRetry::Enabled).await {
-            Err(reason) if should_retry_without_api_key(&reason) => match fallback {
-                Some(req) => self.fetch_json(req, RateLimitRetry::Enabled).await,
-                None => Err(reason),
+        match self.fetch_json(req).await {
+            Err(e) if should_retry_without_api_key(&e.reason) => match fallback {
+                Some(req) => self.fetch_json(req).await,
+                None => Err(e),
             },
             other => other,
         }
     }
 
+    /// Fetch JSON, waiting once when a 429 asks for at most MAX_RATE_LIMIT_SLEEP.
     async fn fetch_json(
         &self,
         req: reqwest::RequestBuilder,
-        retry_rate_limits: RateLimitRetry,
-    ) -> std::result::Result<Value, String> {
+    ) -> std::result::Result<Value, FetchError> {
         let rate_limit_req = req.try_clone();
-        let mut resp = self.send(req).await?;
-        if matches!(retry_rate_limits, RateLimitRetry::Enabled)
-            && resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
-        {
-            if let Some(req) = rate_limit_req {
-                tokio::time::sleep(rate_limit_delay(&resp)).await;
-                resp = self.send(req).await?;
+        let mut resp = self.send(req).await.map_err(|r| FetchError::new(r, true))?;
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            if let (Some(req), Some(delay)) = (rate_limit_req, rate_limit_delay(resp.headers())) {
+                tokio::time::sleep(delay).await;
+                resp = self.send(req).await.map_err(|r| FetchError::new(r, true))?;
             }
         }
-        if !resp.status().is_success() {
-            return Err(http_status_reason("HTTP", resp.status()));
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(FetchError::new(
+                http_status_reason("HTTP", status),
+                crate::error::is_transient_status(status),
+            ));
         }
-        let Some(bytes) = read_body_limited(resp, MAX_JSON_BODY_BYTES).await else {
-            return Err("response too large or unreadable".into());
-        };
-        serde_json::from_slice::<Value>(&bytes).map_err(|_| "invalid JSON response".into())
+        let bytes = read_body_limited(resp, MAX_JSON_BODY_BYTES).await?;
+        serde_json::from_slice::<Value>(&bytes)
+            .map_err(|_| FetchError::new("invalid JSON response", false))
     }
 
     async fn send(
@@ -1075,60 +1112,56 @@ impl Enricher {
         &self,
         paper: &Paper,
         source: Option<AbstractSource>,
-    ) -> Result<EnrichResult> {
-        let url = paper.url.as_deref().expect("paper URL checked by caller");
-        let mut url = match allowed_static_url(url).await {
-            Ok(url) => url,
-            Err(reason) => return Ok(EnrichResult::Missing(reason.into())),
+        transient: &mut Option<String>,
+    ) -> EnrichResult {
+        let mut miss = |reason: String, is_transient: bool| {
+            if is_transient {
+                transient.get_or_insert(reason.clone());
+            }
+            EnrichResult::Missing(reason)
         };
-
+        let mut next = paper.url.clone().expect("paper URL checked by caller");
         for _ in 0..=MAX_STATIC_REDIRECTS {
+            let url = match allowed_static_url(&next).await {
+                Ok(url) => url,
+                Err(reason) => return miss(reason.into(), reason == STATIC_DNS_FAILED),
+            };
             let resp = match self.send(self.client.get(url.clone())).await {
                 Ok(resp) => resp,
-                Err(reason) => return Ok(EnrichResult::Missing(format!("static scrape {reason}"))),
+                Err(reason) => return miss(format!("static scrape {reason}"), true),
             };
             if resp.status().is_redirection() {
                 let Some(next_url) = redirect_url(&url, &resp) else {
-                    return Ok(EnrichResult::Missing(
-                        "redirect without valid location".into(),
-                    ));
+                    return EnrichResult::Missing("redirect without valid location".into());
                 };
-                let next_url = match allowed_static_url(next_url.as_str()).await {
-                    Ok(url) => url,
-                    Err(reason) => return Ok(EnrichResult::Missing(reason.into())),
-                };
-                url = next_url;
+                next = next_url.into();
                 continue;
             }
-            if !resp.status().is_success() {
-                return Ok(EnrichResult::Missing(http_status_reason(
-                    "static scrape HTTP",
-                    resp.status(),
-                )));
+            let status = resp.status();
+            if !status.is_success() {
+                return miss(
+                    http_status_reason("static scrape HTTP", status),
+                    crate::error::is_transient_status(status),
+                );
             }
-            let Some(html) = read_text_limited(resp, MAX_HTML_BODY_BYTES).await else {
-                return Ok(EnrichResult::Missing(
-                    "static page too large or unreadable".into(),
-                ));
+            let html = match read_body_limited(resp, MAX_HTML_BODY_BYTES).await {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                Err(e) => return miss(format!("static scrape {}", e.reason), e.transient),
             };
             if !static_page_title_matches(&html, paper) {
-                return Ok(EnrichResult::Missing(
-                    "static page title did not match paper".into(),
-                ));
+                return EnrichResult::Missing("static page title did not match paper".into());
             }
             let source = source_from_static_url(&url).or(source);
-            return Ok(
-                match abstract_candidates(&html, source)
-                    .into_iter()
-                    .find_map(|abs| usable_abstract_for_title(abs, &paper.title))
-                {
-                    Some(abs) => EnrichResult::Found(abs),
-                    None => EnrichResult::Missing("static page had no extractable abstract".into()),
-                },
-            );
+            return match abstract_candidates(&html, source)
+                .into_iter()
+                .find_map(|abs| usable_abstract_for_title(abs, &paper.title))
+            {
+                Some(abs) => EnrichResult::Found(abs),
+                None => EnrichResult::Missing("static page had no extractable abstract".into()),
+            };
         }
 
-        Ok(EnrichResult::Missing("too many redirects".into()))
+        EnrichResult::Missing("too many redirects".into())
     }
 }
 
@@ -1245,12 +1278,13 @@ fn should_retry_without_api_key(reason: &str) -> bool {
     reason.starts_with("HTTP 401") || reason.starts_with("HTTP 403")
 }
 
-fn rate_limit_delay(resp: &reqwest::Response) -> Duration {
-    let headers = resp.headers();
+/// How long a 429 asks us to wait, or `None` when that is too long to be worth it
+/// (OpenAlex sends the time until its daily budget resets).
+fn rate_limit_delay(headers: &header::HeaderMap) -> Option<Duration> {
     let secs = header_seconds(headers, header::RETRY_AFTER)
         .or_else(|| header_seconds(headers, "ratelimit-reset"))
         .unwrap_or(60);
-    Duration::from_secs(secs.clamp(1, MAX_RATE_LIMIT_SLEEP.as_secs()))
+    (secs <= MAX_RATE_LIMIT_SLEEP.as_secs()).then(|| Duration::from_secs(secs.max(1)))
 }
 
 fn header_seconds(headers: &header::HeaderMap, name: impl header::AsHeaderName) -> Option<u64> {
@@ -1274,7 +1308,7 @@ async fn allowed_static_url(raw: &str) -> std::result::Result<Url, &'static str>
             tokio::time::sleep(TRANSIENT_RETRY_DELAY).await;
             tokio::net::lookup_host((host, port))
                 .await
-                .map_err(|_| "static URL DNS lookup failed")?
+                .map_err(|_| STATIC_DNS_FAILED)?
         }
     };
     let mut has_addr = false;
@@ -1368,24 +1402,28 @@ fn redirect_url(base: &Url, resp: &reqwest::Response) -> Option<Url> {
     base.join(location).ok()
 }
 
-async fn read_text_limited(resp: reqwest::Response, limit: usize) -> Option<String> {
-    let bytes = read_body_limited(resp, limit).await?;
-    Some(String::from_utf8_lossy(&bytes).into_owned())
-}
-
-async fn read_body_limited(mut resp: reqwest::Response, limit: usize) -> Option<Vec<u8>> {
+/// A body over `limit` is final; a read error (such as the request timeout) is transient.
+async fn read_body_limited(
+    mut resp: reqwest::Response,
+    limit: usize,
+) -> std::result::Result<Vec<u8>, FetchError> {
+    let too_large = || FetchError::new("response too large", false);
     if resp.content_length().is_some_and(|len| len > limit as u64) {
-        return None;
+        return Err(too_large());
     }
 
     let mut body = Vec::new();
-    while let Some(chunk) = resp.chunk().await.ok()? {
-        if body.len().checked_add(chunk.len())? > limit {
-            return None;
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|_| FetchError::new("response read failed", true))?
+    {
+        if body.len() + chunk.len() > limit {
+            return Err(too_large());
         }
         body.extend_from_slice(&chunk);
     }
-    Some(body)
+    Ok(body)
 }
 
 #[cfg(test)]
@@ -1501,6 +1539,19 @@ mod tests {
         let mut headers = header::HeaderMap::new();
         headers.insert(header::RETRY_AFTER, header::HeaderValue::from_static("120"));
         assert_eq!(header_seconds(&headers, header::RETRY_AFTER), Some(120));
+    }
+
+    #[test]
+    fn rate_limit_delay_skips_waits_beyond_the_cap() {
+        let mut headers = header::HeaderMap::new();
+        assert_eq!(rate_limit_delay(&headers), Some(Duration::from_secs(60)));
+        headers.insert("ratelimit-reset", header::HeaderValue::from_static("0"));
+        assert_eq!(rate_limit_delay(&headers), Some(Duration::from_secs(1)));
+        headers.insert(
+            header::RETRY_AFTER,
+            header::HeaderValue::from_static("21063"),
+        );
+        assert_eq!(rate_limit_delay(&headers), None);
     }
 
     #[test]
@@ -1827,35 +1878,43 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}/notes", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            socket
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut reader = BufReader::new(socket.try_clone().unwrap());
-            let mut request = String::new();
-            loop {
-                let mut line = String::new();
-                assert!(reader.read_line(&mut line).unwrap() > 0);
-                if line == "\r\n" {
-                    break;
+            let mut requests = Vec::new();
+            for (status, body) in [("200 OK", body.as_str()), ("503 Service Unavailable", "")] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut request = String::new();
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    request.push_str(&line);
                 }
-                request.push_str(&line);
+                write!(
+                    socket,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                requests.push(request);
             }
-            write!(
-                socket,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .unwrap();
-            request
+            requests
         });
 
-        let abstracts = Enricher::new(Secrets::default())
+        let enricher = Enricher::new(Secrets::default());
+        let abstracts = enricher
             .openreview_abstracts_from(&base, &ids)
             .await
             .unwrap();
-        let request = server.join().unwrap();
-        let target = request
+        // An outage keeps the batch's papers retryable instead of remembered as misses.
+        let outage = enricher.openreview_abstracts_from(&base, &ids).await;
+        assert!(outage.is_err_and(|e| e.transient));
+        let requests = server.join().unwrap();
+        let target = requests[0]
             .lines()
             .next()
             .unwrap()
@@ -2030,17 +2089,33 @@ mod tests {
         .await
         .expect("local proxy and enrichment must finish");
 
+        // A batch miss still reaches Crossref, with send()'s one retry; nothing else.
+        let crossref = "CONNECT api.crossref.org:443 HTTP/1.1";
+        assert_eq!(requests, [crossref, crossref]);
         assert!(
-            !requests.is_empty(),
-            "a batch miss must still reach Crossref"
+            results[0].1.is_err(),
+            "an unreachable Crossref keeps the paper retryable"
         );
-        assert!(
-            requests
-                .iter()
-                .all(|request| request == "CONNECT api.crossref.org:443 HTTP/1.1"),
-            "unexpected requests: {requests:?}"
-        );
-        assert!(matches!(&results[0].1, Ok(EnrichResult::Missing(_))));
+    }
+
+    #[tokio::test]
+    async fn static_scrape_outage_is_transient() {
+        // Nothing listens on this proxy, so every request fails like a network outage.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let mut enricher = Enricher::new(Secrets::default());
+        enricher.client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://{closed}")).unwrap())
+            .build()
+            .unwrap();
+        let mut paper = paper("Expected Title");
+        paper.url = Some("https://aclanthology.org/D19-1593/".into());
+        let mut transient = None;
+        let result = enricher.static_scrape(&paper, None, &mut transient).await;
+        assert!(matches!(result, EnrichResult::Missing(_)));
+        assert!(transient.is_some(), "an outage keeps the paper retryable");
     }
 
     #[test]

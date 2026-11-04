@@ -177,6 +177,12 @@ DOIs and DBLP paper URLs to find abstracts.
 cs-grep enrich --jobs 8
 ```
 
+Papers that no source has an abstract for are skipped until a recheck is due:
+after 7 days for this year's papers, 30 days for last year's and 180 days for
+older ones, or sooner when DBLP changes their title, DOI or URL. To retry all of
+them now, for example after adding an API key, run
+`sqlite3 <database> 'DELETE FROM abstract_misses'`.
+
 No API keys are required, but keys can improve rate limits and coverage.
 
 | Variable | Used for | Get a key |

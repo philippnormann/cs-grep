@@ -52,6 +52,17 @@ CREATE TRIGGER IF NOT EXISTS papers_au AFTER UPDATE ON papers BEGIN
     INSERT INTO papers_fts(rowid, title, authors, abstract)
     VALUES (new.id, new.title, new.authors, new.abstract);
 END;
+
+-- Papers no abstract source had.
+CREATE TABLE IF NOT EXISTS abstract_misses (
+    paper_id   INTEGER PRIMARY KEY REFERENCES papers(id) ON DELETE CASCADE,
+    checked_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TRIGGER IF NOT EXISTS abstract_misses_stale AFTER UPDATE OF title, doi, url ON papers
+WHEN old.title IS NOT new.title OR old.doi IS NOT new.doi OR old.url IS NOT new.url BEGIN
+    DELETE FROM abstract_misses WHERE paper_id = new.id;
+END;
 "#;
 
 const PAPER_COLUMNS_WITH_ALIAS: &str =
@@ -190,6 +201,22 @@ impl Database {
             )?;
             for (dblp_key, abstract_text) in abstracts {
                 stmt.execute(rusqlite::params![dblp_key, abstract_text])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Remember papers no source had an abstract for, by dblp_key.
+    pub fn record_abstract_misses(&mut self, keys: &[String]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO abstract_misses (paper_id) \
+                 SELECT id FROM papers WHERE dblp_key = ?1",
+            )?;
+            for dblp_key in keys {
+                stmt.execute([dblp_key])?;
             }
         }
         tx.commit()?;
@@ -462,6 +489,13 @@ fn missing_abstract_parts(
     let mut where_clauses = vec![
         "p.url IS NOT NULL".to_string(),
         "(p.abstract IS NULL OR p.abstract = '')".to_string(),
+        // Recheck misses weekly for this year's papers, monthly for last year's, else twice a year.
+        "NOT EXISTS (SELECT 1 FROM abstract_misses m WHERE m.paper_id = p.id \
+         AND m.checked_at > datetime('now', CASE \
+         WHEN p.year >= CAST(strftime('%Y', 'now') AS INTEGER) THEN '-7 days' \
+         WHEN p.year = CAST(strftime('%Y', 'now') AS INTEGER) - 1 THEN '-30 days' \
+         ELSE '-180 days' END))"
+            .to_string(),
     ];
     if !venues.is_empty() {
         where_clauses.push(in_clause("p.venue", args.len() + 1, venues.len()));
@@ -861,6 +895,45 @@ mod tests {
                 .dblp_key,
             "k2"
         );
+    }
+
+    #[test]
+    fn remembered_misses_wait_for_recheck_or_new_inputs() {
+        let mut db = seeded();
+        let current_year: i32 = db
+            .conn
+            .query_row("SELECT CAST(strftime('%Y', 'now') AS INTEGER)", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let pending_after = |db: &Database, year: i32, days: i32| {
+            db.conn
+                .execute_batch(&format!(
+                    "UPDATE papers SET year = {year} WHERE dblp_key = 'k2';
+                     UPDATE abstract_misses SET checked_at = datetime('now', '-{days} days');"
+                ))
+                .unwrap();
+            db.count_missing_abstracts(&[], &[]).unwrap()
+        };
+        db.record_abstract_misses(&["k2".to_string()]).unwrap();
+        for (year, days, pending) in [
+            (current_year + 1, 6, 0),
+            (current_year, 8, 1),
+            (current_year - 1, 8, 0),
+            (current_year - 1, 31, 1),
+            (2001, 179, 0),
+            (2001, 181, 1),
+        ] {
+            assert_eq!(pending_after(&db, year, days), pending, "{year} {days}");
+        }
+
+        db.conn
+            .execute(
+                "UPDATE papers SET doi = '10.1/new' WHERE dblp_key = 'k2'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(db.count_missing_abstracts(&[], &[]).unwrap(), 1, "new DOI");
     }
 
     #[test]
