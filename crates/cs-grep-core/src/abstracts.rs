@@ -171,34 +171,33 @@ fn openalex_title_hits(results: &Value, title: &str) -> Vec<String> {
         .collect()
 }
 
-/// Same title, year within one, same first author, and not a thesis, editorial or the like.
+/// Same title, year within one, a DBLP surname among the first three OpenAlex
+/// authors, and not a thesis, editorial or the like.
 fn openalex_identity_matches(work: &Value, paper: &Paper) -> bool {
     let title = work.get("title").and_then(|v| v.as_str());
     let year = work.get("publication_year").and_then(|v| v.as_i64());
-    let author = work
-        .get("authorships")
-        .and_then(|v| v.as_array())
-        .and_then(|authors| authors.first())
-        .and_then(|authorship| authorship.get("author"))
-        .and_then(|author| author.get("display_name"))
-        .and_then(|v| v.as_str());
-    let (Some(title), Some(year), Some(author)) = (title, year, author) else {
-        return false;
-    };
-    let Some(paper_first_author) = paper
-        .authors
-        .split(',')
-        .next()
-        .filter(|s| !s.trim().is_empty())
-    else {
-        return false;
-    };
+    let api_authors = normalized_match_text(
+        &work
+            .get("authorships")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .take(3)
+            .filter_map(|a| a.get("author")?.get("display_name")?.as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
     !matches!(
         work.get("type").and_then(|v| v.as_str()),
         Some("dissertation" | "editorial" | "erratum" | "paratext" | "retraction" | "peer-review")
-    ) && titles_match(title, &paper.title)
-        && (year - i64::from(paper.year)).abs() <= 1
-        && normalized_match_text(author) == normalized_match_text(paper_first_author)
+    ) && title.is_some_and(|title| titles_match(title, &paper.title))
+        && year.is_some_and(|year| (year - i64::from(paper.year)).abs() <= 1)
+        && paper.authors.split(',').any(|author| {
+            normalized_match_text(author)
+                .split_whitespace()
+                .last()
+                .is_some_and(|surname| api_authors.split_whitespace().any(|name| name == surname))
+        })
 }
 
 fn normalized_match_text(text: &str) -> String {
@@ -212,8 +211,10 @@ fn normalized_match_text(text: &str) -> String {
         .join(" ")
 }
 
+/// Titles compare without spaces or punctuation: "BIS i" = "BISi", "3-D" = "3D".
 fn titles_match(actual: &str, expected: &str) -> bool {
-    normalized_match_text(actual) == normalized_match_text(expected)
+    normalized_match_text(actual).replace(' ', "")
+        == normalized_match_text(expected).replace(' ', "")
 }
 
 fn doi_titles_match(actual: &str, expected: &str) -> bool {
@@ -223,7 +224,7 @@ fn doi_titles_match(actual: &str, expected: &str) -> bool {
 }
 
 fn subtitle_prefix_matches(longer: &str, shorter: &str) -> bool {
-    [":", " - ", " – ", " — "].iter().any(|delimiter| {
+    [":", " - ", " – ", " — ", "?"].iter().any(|delimiter| {
         longer
             .match_indices(delimiter)
             .any(|(index, _)| titles_match(&longer[..index], shorter))
@@ -1662,6 +1663,17 @@ mod tests {
     }
 
     #[test]
+    fn title_matching_ignores_spacing() {
+        assert!(titles_match("BIS i: A Study", "BISi - a study."));
+        assert!(titles_match("3-D Scene Graphs", "3D scene graphs."));
+        assert!(!titles_match("A Study of Graphs", "A Study of Graph"));
+        assert!(doi_titles_match(
+            "Face Value? Perceptions of Faces",
+            "Face Value?"
+        ));
+    }
+
+    #[test]
     fn doi_batch_helpers_require_matching_doi_and_title() {
         let expected = HashMap::from([("10.1000/right".to_string(), "Expected Title".to_string())]);
         let right = fixture_abstract("Right abstract.");
@@ -1758,11 +1770,16 @@ mod tests {
                 "title": "TD-MPC2: Scalable, Robust World Models for Continuous Control",
                 "publication_year": year,
                 "type": kind,
-                "authorships": [{"author": {"display_name": author}}],
+                "authorships": [
+                    {"author": {"display_name": "Other Person"}},
+                    {"author": {"display_name": author}},
+                ],
             })
         };
         for (author, year, kind, matches) in [
+            ("X. Wang", 2024, "article", true),
             ("Nicklas Hansen", 2023, "article", true),
+            ("Nick Hanson", 2024, "article", false),
             ("Wrong Author", 2024, "article", false),
             ("Nicklas Hansen", 2021, "article", false),
             ("Nicklas Hansen", 2024, "dissertation", false),
