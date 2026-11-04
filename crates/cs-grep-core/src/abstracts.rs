@@ -351,7 +351,32 @@ fn abstract_candidates(html: &str, source: Option<AbstractSource>) -> Vec<String
     };
 
     candidates.extend(meta_contents(&doc));
+    candidates.extend(abstract_after_heading(&doc));
     candidates
+}
+
+/// Text after the first `<h2>`-`<h4>` "Abstract" heading, up to the next heading or list among its siblings.
+fn abstract_after_heading(doc: &Html) -> Option<String> {
+    let selector = Selector::parse("h2, h3, h4").ok()?;
+    let heading = doc.select(&selector).find(|heading| {
+        collapse_ws(&heading.text().collect::<String>())
+            .trim_end_matches(':')
+            .eq_ignore_ascii_case("abstract")
+    })?;
+    let mut text = String::new();
+    for node in heading.next_siblings() {
+        if let Some(element) = ElementRef::wrap(node) {
+            match element.value().name() {
+                "h1" | "h2" | "h3" | "h4" | "ul" | "ol" => break,
+                "script" | "style" | "noscript" => continue,
+                _ => {}
+            }
+            text.extend(element.text().flat_map(|t| [t, " "]));
+        } else if let Some(t) = node.value().as_text() {
+            text.push_str(t);
+        }
+    }
+    non_empty_text(text)
 }
 
 fn extract_ndss_abstract(doc: &Html) -> Option<String> {
@@ -435,25 +460,47 @@ fn meta_contents(doc: &Html) -> Vec<String> {
     texts
 }
 
+const BOILERPLATE_PREFIXES: &[&str] = &[
+    "Promoting openness in scientific communication and the peer-review process",
+    "Electronic proceedings of ",
+    "Paper presented at ",
+    "This repository contains ",
+    "Author(s):",
+    "HAL is a multi-disciplinary open access archive",
+    "Article Share on",
+    "Permission is granted for noncommercial",
+    "Presented on ",
+    "This chapter contains sections titled",
+    "This material is presented to ensure timely dissemination",
+    "Rights to individual papers remain",
+    "(Article begins on next page)",
+    "Provides notice of upcoming conference events",
+];
+
 fn is_boilerplate_abstract(text: &str) -> bool {
-    let year = text.trim_end_matches('.').rsplit(' ').next().unwrap_or("");
-    text.starts_with("Promoting openness in scientific communication and the peer-review process")
-        || text.starts_with("Electronic proceedings of ")
-        || text.starts_with("Paper presented at ")
-        || text.starts_with("This repository contains ")
+    let body = text.trim_end_matches('.');
+    let (head, year) = body.rsplit_once(' ').unwrap_or(("", body));
+    let year_final = year.len() == 4 && year.chars().all(|c| c.is_ascii_digit());
+    BOILERPLATE_PREFIXES
+        .iter()
+        .any(|prefix| text.starts_with(prefix))
+        || text.contains("ResearchGate, letting you")
+        // a short citation: "Authors. Title. Venue. 2019."
+        || (text.len() < 300 && year_final && head.ends_with('.'))
+        // a proceedings title has no sentence end at all
+        || (text.len() < 300
+            && !text.contains(['.', '!', '?'])
+            && (text.contains("Proceedings") || text.contains("Conference")))
         || (text.len() < 300 && text.starts_with("Warning:"))
         || (text.len() < 300 && text.contains(" to me ") && text.contains("I am "))
-        || (text.contains("Authors Info & Claims")
-            && text.contains("View Profile")
-            && text.contains("Get Citation Alerts"))
+        || text.contains("Get Citation Alerts")
         || text
             .strip_prefix('\'')
             .and_then(|text| text.strip_suffix('\''))
             .and_then(|text| text.split_once("' published in '"))
             .is_some_and(|(title, publication)| !title.is_empty() && !publication.is_empty())
         || ((text.contains("Proceedings of ") || text.contains("Findings of "))
-            && ((year.len() == 4 && year.chars().all(|c| c.is_ascii_digit()))
-                || text.contains(". In: ")))
+            && (year_final || text.contains(". In: ")))
 }
 
 fn is_url_only(text: &str) -> bool {
@@ -464,12 +511,88 @@ fn is_url_only(text: &str) -> bool {
 
 fn trim_standard_suffix(text: &str) -> &str {
     let lower = text.to_ascii_lowercase();
-    ["ccs concepts", "acm reference format:", "© 20", "©20"]
-        .iter()
-        .filter_map(|marker| lower.find(marker))
-        .min()
-        .map_or(text, |index| &text[..index])
-        .trim_end()
+    let text = [
+        "ccs concepts",
+        "acm reference format:",
+        "© 20",
+        "©20",
+        "1 introduction",
+        "permission to make digital or hard copies",
+        "personal use of this material is permitted",
+        "© copyright",
+    ]
+    .iter()
+    // "since the 2011 introduction" is not a "1 Introduction" section heading
+    .filter_map(|marker| {
+        lower
+            .match_indices(marker)
+            .map(|(index, _)| index)
+            .find(|&index| !lower[..index].ends_with(|c: char| c.is_ascii_digit()))
+    })
+    .min()
+    .map_or(text, |index| &text[..index])
+    .trim_end();
+    // "... results. Copyright © 2015 AAAI" is cut at "© 20" above; this also repairs stored
+    // abstracts that were cut there
+    text.strip_suffix(" Copyright")
+        .filter(|rest| rest.ends_with(['.', '!', '?', ')']))
+        .unwrap_or(text)
+}
+
+/// PDF and IEEE extraction residue: ligatures ("eﬃcient"), soft hyphens ("sys(cid:173) tem",
+/// "Kuhn(cid:173) Tucker", "buf\u{ad}fers"), and IEEE's quotes in "the modelpsilas output" and
+/// "a dasiacascadepsila".
+fn repair_extraction_marks(text: &str) -> String {
+    let text = text
+        .replace('ﬀ', "ff")
+        .replace('ﬁ', "fi")
+        .replace('ﬂ', "fl")
+        .replace('ﬃ', "ffi")
+        .replace('ﬄ', "ffl")
+        .replace("(cid:173)", "\u{ad}")
+        .replace(" \u{ad}", " -")
+        .replace("\u{ad} ", "\u{ad}");
+    let text = replace_marker(&text, "\u{ad}", |before, after| {
+        let mut end = before.chars().rev();
+        let in_word = end.next().is_some_and(char::is_lowercase)
+            && end.next().is_some_and(char::is_alphabetic);
+        if in_word && after.starts_with(char::is_lowercase) {
+            ""
+        } else {
+            "-"
+        }
+    });
+    let text = replace_marker(&text, "psila", |_, after| {
+        let glued = after
+            .strip_prefix('s')
+            .unwrap_or(after)
+            .starts_with(char::is_alphabetic);
+        if glued {
+            "psila"
+        } else {
+            "'"
+        }
+    });
+    replace_marker(&text, "dasia", |before, _| {
+        if before.ends_with(char::is_alphabetic) {
+            "dasia"
+        } else {
+            "'"
+        }
+    })
+}
+
+/// Replace each `marker` with what `by` picks from the text before and after it.
+fn replace_marker(text: &str, marker: &str, by: impl Fn(&str, &str) -> &'static str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut parts = text.split(marker).peekable();
+    while let Some(part) = parts.next() {
+        out.push_str(part);
+        if let Some(after) = parts.peek() {
+            out.push_str(by(&out, after));
+        }
+    }
+    out
 }
 
 fn element_text(element: ElementRef) -> Option<String> {
@@ -483,7 +606,9 @@ fn abstract_text(text: impl AsRef<str>) -> Option<String> {
     } else {
         text
     };
-    let text = trim_standard_suffix(&text);
+    let text = repair_extraction_marks(&text);
+    let text = strip_footnote_tail(fix_sentence_spacing(trim_standard_suffix(&text)));
+    let text = text.as_str();
     let chars = text.chars().count();
     ((MIN_ABSTRACT_CHARS..=MAX_ABSTRACT_CHARS).contains(&chars)
         && !text.ends_with("...")
@@ -497,6 +622,64 @@ fn abstract_text(text: impl AsRef<str>) -> Option<String> {
     .then(|| text.to_string())
 }
 
+/// "reliable.Specifically" -> "reliable. Specifically", but "U.S.Army" stays as it is.
+fn fix_sentence_spacing(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut word_start = 0;
+    for (i, &c) in chars.iter().enumerate() {
+        if c.is_whitespace() {
+            word_start = i + 1;
+        }
+        out.push(c);
+        if matches!(c, '.' | '!' | '?')
+            && sentence_end_word(&chars[word_start..i])
+            && chars.get(i + 1).is_some_and(char::is_ascii_uppercase)
+            && (chars.get(i + 2).is_some_and(char::is_ascii_lowercase)
+                || (matches!(chars[i + 1], 'A' | 'I') && chars.get(i + 2) == Some(&' ')))
+        {
+            out.push(' ');
+            word_start = i + 1;
+        }
+    }
+    out
+}
+
+fn sentence_end_word(word: &[char]) -> bool {
+    matches!(word.last(), Some(')' | ']' | '%' | '"' | '”'))
+        || (word.iter().all(|&c| c.is_ascii_lowercase() || c == '-')
+            && word.iter().filter(|c| c.is_ascii_lowercase()).count() >= 2
+            && word != ['w', 'w', 'w'])
+}
+
+/// Drop a footnote mark or section number after the last sentence: "results. 1." -> "results.",
+/// but not "in Fig. 1.".
+fn strip_footnote_tail(text: String) -> String {
+    let core = text.strip_suffix('.').unwrap_or(&text);
+    let Some(end) = core.rfind(['.', '!', '?']) else {
+        return text;
+    };
+    let tail = &core[end + 1..];
+    let ends_with_period = core.len() < text.len();
+    let digits = tail.trim_start().replacen(' ', "", 1);
+    let footnote = (1..=2).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit());
+    // a "1." or "I." heading follows a space ("§.3." and "A.I." stay); footnote digits need not
+    let mark = if ends_with_period {
+        tail.starts_with(' ') && (tail == " I" || footnote)
+    } else {
+        footnote
+    };
+    let word = core[..end].rsplit(' ').next().unwrap_or("");
+    // "Fig", "Eq", "No", "Sec" and "Ref" are abbreviations, not sentence ends
+    let abbreviation = word.len() <= 4
+        && word.starts_with(|c: char| c.is_ascii_uppercase())
+        && word[1..].bytes().all(|b| b.is_ascii_lowercase());
+    if mark && word.ends_with(|c: char| !c.is_ascii_digit() && c != '.') && !abbreviation {
+        return core[..=end].to_string();
+    }
+    text
+}
+
 fn non_empty_text(text: impl AsRef<str>) -> Option<String> {
     let decoded = decode_html_entities(text.as_ref());
     let decoded = decode_html_entities(&decoded);
@@ -505,6 +688,9 @@ fn non_empty_text(text: impl AsRef<str>) -> Option<String> {
 }
 
 fn strip_abstract_heading(text: &str) -> &str {
+    let text = text
+        .strip_prefix("Summary form only given.")
+        .map_or(text, str::trim_start);
     let Some(rest) = text
         .get(.."Abstract".len())
         .filter(|prefix| prefix.eq_ignore_ascii_case("Abstract"))
@@ -512,21 +698,24 @@ fn strip_abstract_heading(text: &str) -> &str {
     else {
         return text;
     };
-    if let Some(rest) = [":", ".", " -", " –", " —"]
+    if let Some(rest) = [":", ".", " -", " –", " —", "—", "–"]
         .iter()
         .find_map(|separator| rest.strip_prefix(separator))
     {
         return rest.trim_start();
     }
+    // a bare "ABSTRACT" is a heading; a bare "Abstract" only before a sentence opener, so
+    // "Abstract We present" loses it but "Abstract Interpretation is" keeps it
+    let shouted = text.starts_with("ABSTRACT");
     rest.strip_prefix(' ')
         .filter(|rest| {
             let mut words = rest.split_whitespace();
-            words
+            words.next().is_some_and(|word| {
+                word.starts_with(char::is_uppercase)
+                    && (shouted || ["A", "An", "In", "Our", "The", "This", "We"].contains(&word))
+            }) && !words
                 .next()
                 .is_some_and(|word| word.starts_with(char::is_uppercase))
-                && !words
-                    .next()
-                    .is_some_and(|word| word.starts_with(char::is_uppercase))
         })
         .unwrap_or(text)
 }
@@ -1588,6 +1777,19 @@ mod tests {
             "https:",
             "https://doi.org/10.18653/v1/2023.acl-long.361",
             "http://10.0.72.221/v1/2023.emnlp-main.194",
+            "Author(s): Alice Example, Bob Example Download: Paper (PDF) Date: 2014 Associated Event: NDSS Symposium 2014",
+            "HAL is a multi-disciplinary open access archive for the deposit and dissemination of scientific research documents.",
+            "Join ResearchGate to discover and stay up-to-date with the latest research from leading experts in Security and many other scientific topics. ResearchGate, letting you access and read them immediately.",
+            "Alice Example and Bob Example. A paper title about kernels. Annual Meeting of the Association. 2019.",
+            "EMNLP-CoNLL 2012 - 2012 Joint Conference on Empirical Methods in Natural Language Processing and Computational Natural Language Learning, Proceedings of the Conference",
+            "This chapter contains sections titled: Preliminaries The inference rule Global consistency Local consistency Conclusions References",
+            "Rights to individual papers remain with the author or the author's employer. Permission is granted for noncommercial reproduction of the work.",
+            "This material is presented to ensure timely dissemination of scholarly and technical work. Copyright and all rights therein are retained by authors.",
+            "Personal use of this material is permitted. However, permission to reprint/republish this material for advertising must be obtained from the IEEE.",
+            "(Article begins on next page) The Harvard community has made this article openly available. Please share how this access benefits you. Your story matters.",
+            "Provides notice of upcoming conference events of interest to practitioners and researchers.",
+            "Article A paper title Share on CCS '07: Proceedings of the 14th ACM conference Get Citation AlertsNew Citation Alert added! Save to BinderSave to BinderCreate a New Binder",
+            "Contents List of Tables iv 1 Introduction 1 1.1 The Problem . . . . . . . . . . 1 1.2 Common Attacks . . . . . . . . . . 2 1.3 A Solution . . . . . 4",
         ] {
             assert!(abstract_text(placeholder).is_none(), "{placeholder}");
         }
@@ -1619,9 +1821,25 @@ mod tests {
             .as_deref(),
             Some(abs.as_str())
         );
+        assert_eq!(
+            abstract_text(format!(
+                "{abs} 1 Introduction Recently, the quality of research"
+            ))
+            .as_deref(),
+            Some(abs.as_str())
+        );
+        assert_eq!(
+            abstract_text(format!(
+                "{abs} Permission to make digital or hard copies of all or part"
+            ))
+            .as_deref(),
+            Some(abs.as_str())
+        );
         assert!(
             abstract_text(format!("{abs} Copy to Clipboard Download Related Material")).is_none()
         );
+        // a cut-off first sentence is still real text
+        assert!(abstract_text("We present a simple, but effective method to incorporate syntactic dependency information directly into transformer-based language models (e").is_some());
         assert_eq!(
             abstract_text(format!("<p>{abs}</p>")).as_deref(),
             Some(abs.as_str())
@@ -1637,6 +1855,71 @@ mod tests {
             "A Paper - With Punctuation"
         )
         .is_none());
+    }
+
+    #[test]
+    fn repairs_stored_abstract_typography() {
+        let abs = fixture_abstract("Clean abstract.");
+        for (raw, want) in [
+            (format!("Abstract—{abs}"), abs.clone()),
+            (format!("Summary form only given. {abs}"), abs.clone()),
+            (format!("{abs} 1"), abs.clone()),
+            (format!("{abs}12"), abs.clone()),
+            (
+                format!("Results are reliable.Specifically, we win. {abs}"),
+                format!("Results are reliable. Specifically, we win. {abs}"),
+            ),
+            (format!("{abs} 1."), abs.clone()),
+            (format!("{abs} I."), abs.clone()),
+            (format!("{abs} 1 1"), abs.clone()),
+            (format!("{abs} Gains in BLEU. 1"), format!("{abs} Gains in BLEU.")),
+            (format!("{abs} Copyright"), abs.clone()),
+            (
+                format!("Eﬃcient Ma(cid:173) chines of Kuhn(cid:173) Tucker, Q(cid:173) learning, buf\u{ad}fers, ports \u{ad} the. {abs}"),
+                format!("Efficient Machines of Kuhn-Tucker, Q-learning, buffers, ports - the. {abs}"),
+            ),
+            (
+                format!("The modelpsilas dasiacascadepsila and Apsila, not ipsilateral. {abs}"),
+                format!("The model's 'cascade' and A', not ipsilateral. {abs}"),
+            ),
+            (
+                format!("We pre-train.Then (LLMs).In [1].We 5%.We 7 %.We \"wiser\".We use it.A {abs}"),
+                format!("We pre-train. Then (LLMs). In [1]. We 5%. We 7 %. We \"wiser\". We use it. A {abs}"),
+            ),
+        ] {
+            let once = abstract_text(&raw);
+            assert_eq!(once.as_deref(), Some(want.as_str()), "{raw}");
+            assert_eq!(abstract_text(once.unwrap()).as_deref(), Some(want.as_str()));
+        }
+        for kept in [
+            format!("We use e.g.Using TensorFlow.We and U.S.Army data. {abs}"),
+            format!("Data is at www.WelQrate.org. {abs}"),
+            format!("{abs} We use Python 3.12"),
+            format!("{abs} Use responsible A.I."),
+            format!("{abs} See Ref. 12"),
+            format!("{abs} Up 99%.... 1"),
+            format!("{abs} On Fair Use and Copyright"),
+            format!("{abs} We study the EU copyright 2019 reform."),
+            format!("{abs} See Fig. 1."),
+            format!("{abs} A mIoU of 54. 7."),
+            format!("{abs} Since the 2011 introduction of SDN, controllers grew."),
+        ] {
+            assert_eq!(abstract_text(&kept).as_deref(), Some(kept.as_str()));
+        }
+    }
+
+    #[test]
+    fn html_abstract_heading_reads_siblings_until_next_heading_or_list() {
+        let first = fixture_abstract("First paragraph.");
+        let html = format!(
+            "<html><body><h1>Paper</h1><h3>Abstract:</h3><p>{first}</p><script>track(1);</script>\
+             <style>p {{ color: red }}</style><noscript>Enable JavaScript</noscript><p>Second paragraph.</p>\
+             <ul><li>View the full text</li></ul><p>Footer</p></body></html>"
+        );
+        assert_eq!(
+            abstract_candidates(&html, None).last().map(String::as_str),
+            Some(format!("{first} Second paragraph.").as_str())
+        );
     }
 
     #[test]
@@ -2382,6 +2665,11 @@ mod tests {
             non_empty_text("Abstract We present a new method.").as_deref(),
             Some("We present a new method.")
         );
+        let theory = "Abstract Interpretation is a theory of sound approximation.";
+        assert_eq!(non_empty_text(theory).as_deref(), Some(theory));
+        let once = non_empty_text(format!("Abstract: {theory}")).unwrap();
+        assert_eq!(once, theory);
+        assert_eq!(non_empty_text(&once).as_deref(), Some(theory));
     }
 
     #[test]
