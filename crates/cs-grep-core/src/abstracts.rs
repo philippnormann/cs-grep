@@ -40,10 +40,8 @@ const MAX_ABSTRACT_CHARS: usize = 6_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum AbstractSource {
     Acl,
-    Acm,
     Cvf,
     Iclr,
-    Ieee,
     Ijcai,
     Ndss,
     Neurips,
@@ -337,11 +335,7 @@ fn abstract_candidates(html: &str, source: Option<AbstractSource>) -> Vec<String
 
     let mut candidates = match source {
         Some(AbstractSource::Acl) => selector_texts(&doc, &[".acl-abstract span"]),
-        Some(AbstractSource::Acm) => {
-            selector_texts(&doc, &["div.abstractInFull", "div.abstractSection"])
-        }
         Some(AbstractSource::Cvf) => selector_texts(&doc, &["div#abstract"]),
-        Some(AbstractSource::Ieee) => selector_texts(&doc, &["div.abstract-text"]),
         Some(AbstractSource::Ijcai) => {
             let text = selector_texts(&doc, &[".article__abstract > p:not(.eyebrow)"]).join(" ");
             non_empty_text(text)
@@ -775,7 +769,6 @@ impl Enricher {
                         "warning: Semantic Scholar DOI batch lookup failed: {}",
                         terminal_safe(&error)
                     );
-                    retry_individually.extend(chunk.iter().cloned());
                     HashMap::new()
                 }
             };
@@ -803,9 +796,6 @@ impl Enricher {
 
     async fn enrich_after_prefetch(&self, paper: &Paper) -> Result<EnrichResult> {
         if let Some(abs) = self.api_by_doi(paper).await? {
-            return Ok(EnrichResult::Found(abs));
-        }
-        if let Some(abs) = self.openreview_api_abstract(paper).await {
             return Ok(EnrichResult::Found(abs));
         }
         self.fallback_enrich(paper).await
@@ -845,20 +835,6 @@ impl Enricher {
             return Ok(None);
         };
         if !self.doi_cache.contains_key(&doi) {
-            let s2 = format!(
-                "https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}?fields=title,abstract"
-            );
-            if let Some(abs) = self
-                .fetch_semantic_scholar_json(self.client.get(&s2))
-                .await
-                .ok()
-                .filter(|json| json_doi_title_matches(json, &paper.title))
-                .and_then(|json| abstract_from_semantic_scholar(&json))
-                .and_then(|abs| usable_abstract_for_title(abs, &paper.title))
-            {
-                return Ok(Some(abs));
-            }
-
             if let Some(abs) = self
                 .fetch_openalex_json(&format!("https://api.openalex.org/works/doi:{doi}"), &[])
                 .await
@@ -953,30 +929,6 @@ impl Enricher {
             .ok()
             .and_then(|json| abstract_from_semantic_scholar_title_search(&json, paper))
             .and_then(|abs| usable_abstract_for_title(abs, &paper.title)))
-    }
-
-    async fn openreview_api_abstract(&self, paper: &Paper) -> Option<String> {
-        let forum_id = openreview_forum_id(paper.url.as_deref()?)?;
-        for base in [
-            "https://api2.openreview.net/notes",
-            "https://api.openreview.net/notes",
-        ] {
-            let req = self
-                .openreview_get(base)
-                .await
-                .query(&[("id", forum_id.as_str())]);
-            let Ok(json) = self.fetch_json(req, RateLimitRetry::Enabled).await else {
-                continue;
-            };
-            if let Some(abs) = abstracts_from_openreview_notes(&json)
-                .get(&forum_id)
-                .cloned()
-                .and_then(|abs| usable_abstract_for_title(abs, &paper.title))
-            {
-                return Some(abs);
-            }
-        }
-        None
     }
 
     async fn openreview_abstracts_from(
@@ -1184,8 +1136,6 @@ fn source_from_static_url(url: &Url) -> Option<AbstractSource> {
     let host = url.host_str()?.trim_end_matches('.').to_ascii_lowercase();
     match host.as_str() {
         "aclanthology.org" | "www.aclanthology.org" => Some(AbstractSource::Acl),
-        "dl.acm.org" => Some(AbstractSource::Acm),
-        "doi.ieeecomputersociety.org" | "ieeexplore.ieee.org" => Some(AbstractSource::Ieee),
         "ijcai.org" | "www.ijcai.org" => Some(AbstractSource::Ijcai),
         "openaccess.thecvf.com" => Some(AbstractSource::Cvf),
         "proceedings.iclr.cc" => Some(AbstractSource::Iclr),
@@ -1256,9 +1206,7 @@ fn source_from_doi_url(url: &Url) -> Option<AbstractSource> {
     }
     let doi = url.path().trim_start_matches('/').to_ascii_lowercase();
     match doi.as_str() {
-        doi if doi.starts_with("10.1145/") => Some(AbstractSource::Acm),
         doi if doi.starts_with("10.18653/") => Some(AbstractSource::Acl),
-        doi if doi.starts_with("10.1109/") => Some(AbstractSource::Ieee),
         doi if doi.starts_with("10.24963/") => Some(AbstractSource::Ijcai),
         doi if doi.starts_with("10.1007/") => Some(AbstractSource::Springer),
         doi if doi.starts_with("10.14722/") => Some(AbstractSource::Ndss),
@@ -1294,9 +1242,7 @@ fn http_status_reason(prefix: &str, status: reqwest::StatusCode) -> String {
 }
 
 fn should_retry_without_api_key(reason: &str) -> bool {
-    reason.starts_with("HTTP 401")
-        || reason.starts_with("HTTP 403")
-        || reason.starts_with("HTTP 429")
+    reason.starts_with("HTTP 401") || reason.starts_with("HTTP 403")
 }
 
 fn rate_limit_delay(resp: &reqwest::Response) -> Duration {
@@ -1535,9 +1481,9 @@ mod tests {
     }
 
     #[test]
-    fn api_key_fallback_is_limited_to_auth_or_rate_statuses() {
+    fn api_key_fallback_is_limited_to_auth_statuses() {
         assert!(should_retry_without_api_key("HTTP 403 (blocked)"));
-        assert!(should_retry_without_api_key("HTTP 429 (rate limited)"));
+        assert!(!should_retry_without_api_key("HTTP 429 (rate limited)"));
         assert!(!should_retry_without_api_key("HTTP 404 (request failed)"));
     }
 
@@ -1991,10 +1937,6 @@ mod tests {
             Some(AbstractSource::Usenix)
         );
         assert_eq!(
-            source_from_static_url(&Url::parse("https://dl.acm.org/doi/10.1145/x").unwrap()),
-            Some(AbstractSource::Acm)
-        );
-        assert_eq!(
             source_from_static_url(&Url::parse("https://aclanthology.org/D19-1593/").unwrap()),
             Some(AbstractSource::Acl)
         );
@@ -2026,7 +1968,7 @@ mod tests {
         );
         assert_eq!(
             source_from_paper_url("https://doi.org/10.1145/3678890.3678926"),
-            Some(AbstractSource::Acm)
+            None
         );
         assert_eq!(
             source_from_paper_url("https://doi.org/10.18653/V1/D19-1593"),
@@ -2034,7 +1976,7 @@ mod tests {
         );
         assert_eq!(
             source_from_paper_url("https://doi.org/10.1109/RAID67961.2025.00012"),
-            Some(AbstractSource::Ieee)
+            None
         );
         assert_eq!(
             source_from_paper_url("https://doi.org/10.24963/ijcai.2024/1"),
@@ -2107,17 +2049,6 @@ mod tests {
         assert_eq!(
             abstract_from_crossref(&msg).as_deref(),
             Some("A bold claim.")
-        );
-    }
-
-    #[test]
-    fn html_acm_source_specific_selector() {
-        let html = r#"<html><body>
-            <div class="abstractInFull"><p>This is the ACM abstract.</p></div>
-        </body></html>"#;
-        assert_eq!(
-            extract_abstract_html(html, Some(AbstractSource::Acm)).as_deref(),
-            Some("This is the ACM abstract.")
         );
     }
 
@@ -2322,19 +2253,6 @@ mod tests {
     }
 
     #[test]
-    fn html_ieee_prefers_abstract_text_selector() {
-        let html = r#"<html><head>
-            <meta property="og:description" content="IEEE fallback abstract.">
-        </head><body>
-            <div class="abstract-text">This is the IEEE abstract.</div>
-        </body></html>"#;
-        assert_eq!(
-            extract_abstract_html(html, Some(AbstractSource::Ieee)).as_deref(),
-            Some("This is the IEEE abstract.")
-        );
-    }
-
-    #[test]
     fn html_springer_prefers_full_abstract_section_over_truncated_meta() {
         let html = r#"<html><head>
             <meta property="og:description" content="Truncated Springer abstract...">
@@ -2431,14 +2349,12 @@ mod tests {
     fn static_scrape_normalizes_only_allowed_publishers() {
         for raw in [
             "https://doi.org/10.9999/example",
-            "https://dl.acm.org/doi/10.1145/example",
             "https://datasets-benchmarks-proceedings.neurips.cc/paper/1",
             "https://aaai.org/paper/1",
             "https://www.aaai.org/paper/1",
             "https://ojs.aaai.org/paper/1",
             "https://iclr.cc/paper/1",
             "https://www.iclr.cc/paper/1",
-            "https://doi.ieeecomputersociety.org/10.1109/example",
             "https://idp.springer.com/authorize",
         ] {
             assert_eq!(static_fetch_url(raw).unwrap().as_str(), raw);
@@ -2458,10 +2374,12 @@ mod tests {
         );
 
         for raw in [
-            "http://dl.acm.org:8080/doi/10.1145/example",
-            "https://dl.acm.org:8443/doi/10.1145/example",
+            "http://www.usenix.org:8080/conference/example",
+            "https://www.usenix.org:8443/conference/example",
             "https://example.com/paper",
-            "https://dl.acm.org.attacker.example/paper",
+            "https://dl.acm.org/doi/10.1145/example",
+            "https://ieeexplore.ieee.org/document/1",
+            "https://doi.ieeecomputersociety.org/10.1109/example",
             "https://attacker.neurips.cc/paper",
             "https://aaai.org.attacker.example/paper",
             "https://attacker.iclr.cc/paper",
