@@ -34,3 +34,25 @@ pub enum Error {
     #[error("{0}")]
     Other(String),
 }
+
+/// The shared rule for an HTTP status that may be a passing outage.
+pub(crate) fn is_transient_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error() || matches!(status.as_u16(), 408 | 429)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::StatusCode;
+
+    #[test]
+    fn is_transient_status_matches_only_passing_failures() {
+        assert!(is_transient_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_transient_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(is_transient_status(StatusCode::BAD_GATEWAY));
+        assert!(!is_transient_status(StatusCode::BAD_REQUEST));
+        assert!(!is_transient_status(StatusCode::NOT_FOUND));
+        // Redirects are not retried.
+        assert!(!is_transient_status(StatusCode::MOVED_PERMANENTLY));
+    }
+}

@@ -6,6 +6,7 @@ use serde_json::Value;
 
 use crate::abstracts::{collapse_ws, decode_html_entities};
 use crate::config::Venue;
+use crate::error::is_transient_status;
 use crate::{Error, Paper, Result};
 
 pub const DEFAULT_ENDPOINT: &str = "https://sparql.dblp.org/sparql";
@@ -147,7 +148,7 @@ impl Dblp {
     }
 
     /// Fetch and parse the papers of a venue from `min_year` on, except those
-    /// also listed in one of the `later` streams.
+    /// also listed in one of the `later` streams. Retries transient failures.
     pub async fn fetch_venue(
         &self,
         venue: &Venue,
@@ -155,16 +156,33 @@ impl Dblp {
         later: &[&str],
     ) -> Result<Vec<Paper>> {
         let query = build_query(&venue.dblp_stream, min_year, later);
-        let resp = self
-            .client
+        let mut json = self.fetch_json(&query).await;
+        for delay in [5, 10] {
+            // No status means a network, body or decode error; a truncated
+            // SPARQL body fails to decode, so those are retried too.
+            if !json
+                .as_ref()
+                .is_err_and(|e| e.status().is_none_or(is_transient_status))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(delay)).await;
+            json = self.fetch_json(&query).await;
+        }
+        // The URL holds the whole query; keep it out of error messages.
+        parse_results(&json.map_err(reqwest::Error::without_url)?, &venue.id)
+    }
+
+    async fn fetch_json(&self, query: &str) -> reqwest::Result<Value> {
+        self.client
             .get(&self.endpoint)
-            .query(&[("query", query.as_str())])
+            .query(&[("query", query)])
             .header("Accept", "application/sparql-results+json")
             .send()
             .await?
-            .error_for_status()?;
-        let json: Value = resp.json().await?;
-        parse_results(&json, &venue.id)
+            .error_for_status()?
+            .json()
+            .await
     }
 }
 
