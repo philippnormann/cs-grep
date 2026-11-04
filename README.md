@@ -171,7 +171,7 @@ last one.
 ## Abstracts
 
 Abstract enrichment is optional, cached, and best-effort. cs-grep uses paper
-DOIs and DBLP paper URLs to find abstracts.
+DOIs, titles and DBLP paper URLs to find abstracts.
 
 ```sh
 cs-grep enrich --jobs 8

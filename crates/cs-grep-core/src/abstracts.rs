@@ -87,24 +87,6 @@ fn abstract_from_semantic_scholar(paper: &Value) -> Option<String> {
         .and_then(non_empty_text)
 }
 
-fn abstract_from_openalex_title_search(results: &Value, paper: &Paper) -> Option<String> {
-    results
-        .get("results")?
-        .as_array()?
-        .iter()
-        .find(|work| openalex_identity_matches(work, paper))
-        .and_then(abstract_from_openalex)
-}
-
-fn abstract_from_semantic_scholar_title_search(results: &Value, paper: &Paper) -> Option<String> {
-    results
-        .get("data")?
-        .as_array()?
-        .iter()
-        .find(|work| semantic_scholar_identity_matches(work, paper))
-        .and_then(abstract_from_semantic_scholar)
-}
-
 fn abstracts_from_openalex_works(
     results: &Value,
     expected_titles: &HashMap<String, String>,
@@ -166,11 +148,32 @@ fn abstracts_from_semantic_scholar_batch(
     out
 }
 
+/// Work ids of the first three autocomplete hits whose title matches.
+fn openalex_title_hits(results: &Value, title: &str) -> Vec<String> {
+    results
+        .get("results")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|hit| {
+            hit.get("display_name")
+                .and_then(|v| v.as_str())
+                .is_some_and(|name| titles_match(name, title))
+        })
+        .filter_map(|hit| {
+            hit.get("id")?
+                .as_str()?
+                .rsplit('/')
+                .next()
+                .map(str::to_string)
+        })
+        .take(3)
+        .collect()
+}
+
+/// Same title, year within one, same first author, and not a thesis, editorial or the like.
 fn openalex_identity_matches(work: &Value, paper: &Paper) -> bool {
-    let title = work
-        .get("title")
-        .or_else(|| work.get("display_name"))
-        .and_then(|v| v.as_str());
+    let title = work.get("title").and_then(|v| v.as_str());
     let year = work.get("publication_year").and_then(|v| v.as_i64());
     let author = work
         .get("authorships")
@@ -179,34 +182,7 @@ fn openalex_identity_matches(work: &Value, paper: &Paper) -> bool {
         .and_then(|authorship| authorship.get("author"))
         .and_then(|author| author.get("display_name"))
         .and_then(|v| v.as_str());
-    paper_identity_matches(title, year, author, paper)
-}
-
-fn semantic_scholar_identity_matches(work: &Value, paper: &Paper) -> bool {
-    let title = work.get("title").and_then(|v| v.as_str());
-    let year = work.get("year").and_then(|v| v.as_i64());
-    let author = work
-        .get("authors")
-        .and_then(|v| v.as_array())
-        .and_then(|authors| authors.first())
-        .and_then(|author| author.get("name"))
-        .and_then(|v| v.as_str());
-    paper_identity_matches(title, year, author, paper)
-}
-
-fn paper_identity_matches(
-    title: Option<&str>,
-    year: Option<i64>,
-    first_author: Option<&str>,
-    paper: &Paper,
-) -> bool {
-    let Some(title) = title else {
-        return false;
-    };
-    let Some(year) = year else {
-        return false;
-    };
-    let Some(first_author) = first_author else {
+    let (Some(title), Some(year), Some(author)) = (title, year, author) else {
         return false;
     };
     let Some(paper_first_author) = paper
@@ -217,9 +193,12 @@ fn paper_identity_matches(
     else {
         return false;
     };
-    normalized_match_text(title) == normalized_match_text(&paper.title)
+    !matches!(
+        work.get("type").and_then(|v| v.as_str()),
+        Some("dissertation" | "editorial" | "erratum" | "paratext" | "retraction" | "peer-review")
+    ) && titles_match(title, &paper.title)
         && (year - i64::from(paper.year)).abs() <= 1
-        && normalized_match_text(first_author) == normalized_match_text(paper_first_author)
+        && normalized_match_text(author) == normalized_match_text(paper_first_author)
 }
 
 fn normalized_match_text(text: &str) -> String {
@@ -856,10 +835,8 @@ impl Enricher {
             }
         }
 
-        if paper.doi.as_deref().and_then(normalized_doi).is_none() {
-            if let Some(abs) = self.api_by_title(paper, transient).await {
-                return EnrichResult::Found(abs);
-            }
+        if let Some(abs) = self.api_by_title(paper, transient).await {
+            return EnrichResult::Found(abs);
         }
         if let Some(reason) = static_miss {
             return EnrichResult::Missing(reason);
@@ -938,36 +915,38 @@ impl Enricher {
         ))
     }
 
+    /// Free OpenAlex endpoints: autocomplete for candidates, then each work by id.
     async fn api_by_title(&self, paper: &Paper, transient: &mut Option<String>) -> Option<String> {
-        if let Some(abs) = ok_or_note(
+        let hits = ok_or_note(
             "OpenAlex",
             self.fetch_openalex_json(
-                "https://api.openalex.org/works",
-                &[("search", paper.title.as_str()), ("per-page", "10")],
+                "https://api.openalex.org/autocomplete/works",
+                &[("q", paper.title.as_str())],
             )
             .await,
             transient,
-        )
-        .and_then(|json| abstract_from_openalex_title_search(&json, paper))
-        .and_then(|abs| usable_abstract_for_title(abs, &paper.title))
-        {
-            return Some(abs);
-        }
-
-        let s2_req = self
-            .client
-            .get("https://api.semanticscholar.org/graph/v1/paper/search/match")
-            .query(&[
-                ("query", paper.title.as_str()),
-                ("limit", "5"),
-                ("fields", "title,year,authors,abstract"),
-            ]);
-        // Semantic Scholar is best-effort: keyless it is rate limited most of the time.
-        self.fetch_semantic_scholar_json(s2_req)
-            .await
-            .ok()
-            .and_then(|json| abstract_from_semantic_scholar_title_search(&json, paper))
+        )?;
+        for id in openalex_title_hits(&hits, &paper.title) {
+            if let Some(abs) = ok_or_note(
+                "OpenAlex",
+                self.fetch_openalex_json(
+                    &format!("https://api.openalex.org/works/{id}"),
+                    &[(
+                        "select",
+                        "title,publication_year,authorships,type,abstract_inverted_index",
+                    )],
+                )
+                .await,
+                transient,
+            )
+            .filter(|work| openalex_identity_matches(work, paper))
+            .and_then(|work| abstract_from_openalex(&work))
             .and_then(|abs| usable_abstract_for_title(abs, &paper.title))
+            {
+                return Some(abs);
+            }
+        }
+        None
     }
 
     async fn openreview_abstracts_from(
@@ -1758,63 +1737,42 @@ mod tests {
     }
 
     #[test]
-    fn openalex_title_search_requires_identity_match() {
-        let results = json!({
-            "results": [
-                {
-                    "title": "TD-MPC2: Scalable, Robust World Models for Continuous Control",
-                    "publication_year": 2024,
-                    "authorships": [{"author": {"display_name": "Wrong Author"}}],
-                    "abstract": "Wrong author abstract."
-                },
-                {
-                    "title": "TD-MPC2: Scalable, Robust World Models for Continuous Control",
-                    "publication_year": 2023,
-                    "authorships": [{"author": {"display_name": "Nicklas Hansen"}}],
-                    "abstract": "Right abstract."
-                }
-            ]
-        });
-        assert_eq!(
-            abstract_from_openalex_title_search(
-                &results,
-                &paper("TD-MPC2: Scalable, Robust World Models for Continuous Control.")
-            )
-            .as_deref(),
-            Some("Right abstract.")
-        );
-        assert_eq!(
-            abstract_from_openalex_title_search(&results, &paper("Different Title")),
-            None
-        );
+    fn openalex_title_hits_keep_first_three_matching_titles() {
+        let title = "TD-MPC2: Scalable, Robust World Models for Continuous Control.";
+        let hit = |id: &str, name: &str| json!({"id": format!("https://openalex.org/{id}"), "display_name": name});
+        let results = json!({"results": [
+            hit("W1", "TD-MPC2: Scalable, Robust World Models for Continuous Control"),
+            hit("W2", "TD-MPC: Temporal Difference Learning for Model Predictive Control"),
+            hit("W3", "TD-MPC2 - Scalable, Robust World Models for Continuous Control"),
+            hit("W4", "TD-MPC2: scalable, robust world models for continuous control"),
+            hit("W5", "TD-MPC2: Scalable, Robust World Models for Continuous Control"),
+        ]});
+        assert_eq!(openalex_title_hits(&results, title), ["W1", "W3", "W4"]);
     }
 
     #[test]
-    fn semantic_scholar_title_search_requires_identity_match() {
-        let results = json!({
-            "data": [
-                {
-                    "title": "TD-MPC2: Scalable, Robust World Models for Continuous Control",
-                    "year": 2024,
-                    "authors": [{"name": "Wrong Author"}],
-                    "abstract": "Wrong author abstract."
-                },
-                {
-                    "title": "TD-MPC2: Scalable, Robust World Models for Continuous Control",
-                    "year": 2023,
-                    "authors": [{"name": "Nicklas Hansen"}],
-                    "abstract": "Right abstract."
-                }
-            ]
-        });
-        assert_eq!(
-            abstract_from_semantic_scholar_title_search(
-                &results,
-                &paper("TD-MPC2: Scalable, Robust World Models for Continuous Control.")
-            )
-            .as_deref(),
-            Some("Right abstract.")
-        );
+    fn openalex_title_route_requires_identity_match() {
+        let td_mpc = paper("TD-MPC2: Scalable, Robust World Models for Continuous Control.");
+        let work = |author: &str, year: i64, kind: &str| {
+            json!({
+                "title": "TD-MPC2: Scalable, Robust World Models for Continuous Control",
+                "publication_year": year,
+                "type": kind,
+                "authorships": [{"author": {"display_name": author}}],
+            })
+        };
+        for (author, year, kind, matches) in [
+            ("Nicklas Hansen", 2023, "article", true),
+            ("Wrong Author", 2024, "article", false),
+            ("Nicklas Hansen", 2021, "article", false),
+            ("Nicklas Hansen", 2024, "dissertation", false),
+            ("Nicklas Hansen", 2024, "editorial", false),
+        ] {
+            let work = work(author, year, kind);
+            assert_eq!(openalex_identity_matches(&work, &td_mpc), matches, "{work}");
+        }
+        let work = work("Nicklas Hansen", 2024, "article");
+        assert!(!openalex_identity_matches(&work, &paper("Different Title")));
     }
 
     #[test]
@@ -2089,9 +2047,10 @@ mod tests {
         .await
         .expect("local proxy and enrichment must finish");
 
-        // A batch miss still reaches Crossref, with send()'s one retry; nothing else.
+        // DOI route (Crossref), then title route (OpenAlex autocomplete), each sent twice by send().
         let crossref = "CONNECT api.crossref.org:443 HTTP/1.1";
-        assert_eq!(requests, [crossref, crossref]);
+        let openalex = "CONNECT api.openalex.org:443 HTTP/1.1";
+        assert_eq!(requests, [crossref, crossref, openalex, openalex]);
         assert!(
             results[0].1.is_err(),
             "an unreachable Crossref keeps the paper retryable"

@@ -487,7 +487,6 @@ fn missing_abstract_parts(
 ) -> SearchQueryParts {
     let mut args: Vec<Value> = Vec::new();
     let mut where_clauses = vec![
-        "p.url IS NOT NULL".to_string(),
         "(p.abstract IS NULL OR p.abstract = '')".to_string(),
         // Recheck misses weekly for this year's papers, monthly for last year's, else twice a year.
         "NOT EXISTS (SELECT 1 FROM abstract_misses m WHERE m.paper_id = p.id \
@@ -878,6 +877,17 @@ mod tests {
             .papers_missing_abstract_batch(&[], &[], missing[0].id, 10)
             .unwrap();
         assert!(next.is_empty());
+    }
+
+    #[test]
+    fn missing_abstract_batch_includes_papers_without_url() {
+        let mut db = seeded();
+        let no_url = Paper {
+            url: None,
+            ..paper("k4", "AAAI", 2004, "A paper without a URL", None)
+        };
+        db.upsert_papers(&[no_url]).unwrap();
+        assert_eq!(db.count_missing_abstracts(&[], &[]).unwrap(), 2);
     }
 
     #[test]
