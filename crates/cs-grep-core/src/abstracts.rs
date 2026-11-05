@@ -21,6 +21,7 @@ use serde_json::Value;
 
 use crate::config::Secrets;
 use crate::output::terminal_safe;
+use crate::text::{collapse_ws, decode_html_entities};
 use crate::{Paper, Result};
 
 const MAX_JSON_BODY_BYTES: usize = 4 * 1024 * 1024;
@@ -307,10 +308,6 @@ fn crossref_title_matches(message: &Value, expected: &str) -> bool {
         .and_then(|titles| titles.first())
         .and_then(|v| v.as_str())
         .is_some_and(|title| doi_titles_match(title, expected))
-}
-
-pub(crate) fn collapse_ws(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Extract abstract candidates from a publisher page in priority order.
@@ -745,53 +742,6 @@ fn static_page_title_matches(html: &str, paper: &Paper) -> bool {
         .filter_map(normalized_doi)
         .any(|page_doi| page_doi == doi)
         && doi_titles_match(title, &paper.title)
-}
-
-pub(crate) fn decode_html_entities(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-
-    while let Some(idx) = rest.find('&') {
-        out.push_str(&rest[..idx]);
-        let entity_start = idx + 1;
-        let Some(entity_len) = rest[entity_start..].find(';') else {
-            out.push_str(&rest[idx..]);
-            return out;
-        };
-        let entity_end = entity_start + entity_len;
-        let entity = &rest[entity_start..entity_end];
-        match decode_entity(entity) {
-            Some(decoded) => out.push_str(&decoded),
-            None => out.push_str(&rest[idx..=entity_end]),
-        }
-        rest = &rest[entity_end + 1..];
-    }
-
-    out.push_str(rest);
-    out
-}
-
-fn decode_entity(entity: &str) -> Option<String> {
-    if let Some(hex) = entity
-        .strip_prefix("#x")
-        .or_else(|| entity.strip_prefix("#X"))
-    {
-        let code = u32::from_str_radix(hex, 16).ok()?;
-        return char::from_u32(code).map(|c| c.to_string());
-    }
-    if let Some(dec) = entity.strip_prefix('#') {
-        let code = dec.parse::<u32>().ok()?;
-        return char::from_u32(code).map(|c| c.to_string());
-    }
-    match entity {
-        "amp" => Some("&".to_string()),
-        "apos" => Some("'".to_string()),
-        "gt" => Some(">".to_string()),
-        "lt" => Some("<".to_string()),
-        "nbsp" => Some(" ".to_string()),
-        "quot" => Some("\"".to_string()),
-        _ => None,
-    }
 }
 
 /// Networked abstract enrichment using the configured API keys.
