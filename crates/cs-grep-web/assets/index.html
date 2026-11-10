@@ -4,7 +4,9 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>cs-grep</title>
+<link rel="icon" href="data:," />
 <link rel="stylesheet" href="static/styles.css" />
+<link rel="stylesheet" href="static/filters.css" />
 <script>
 (function () {
   let saved;
@@ -25,8 +27,12 @@
         <button class="sort-btn" data-sort="relevance" aria-pressed="false">relevance</button>
         <button class="sort-btn" data-sort="venue" aria-pressed="false">venue</button>
       </div>
+      <button id="filter-button" class="modal-btn filter-button" hidden>Filters<span id="filter-count" class="filter-count"></span></button>
     </div>
-    <div id="status" class="status" role="status" aria-live="polite"></div>
+    <div class="summary">
+      <div id="pills" class="pills" role="group" aria-label="Active filters"></div>
+      <div id="status" class="status" role="status" aria-live="polite"></div>
+    </div>
   </header>
   <main class="main">
     <section id="results" class="results" role="listbox" aria-label="Search results" tabindex="0">
@@ -46,6 +52,30 @@
     </button>
   </footer>
 </div>
+<dialog id="filter-dialog" class="modal filter-dialog" aria-labelledby="filter-heading">
+  <form method="dialog" class="modal-header">
+    <h3 id="filter-heading">Filters <span id="filter-scope" class="filter-scope"></span></h3>
+    <button class="modal-close" aria-label="Close filters">&times;</button>
+  </form>
+  <div class="filter-body">
+    <fieldset id="topics"><legend>Topics <small>(any of)</small></legend></fieldset>
+    <fieldset><legend>Venue rank</legend><select id="rank-select" class="search-input" aria-label="Venue rank"></select></fieldset>
+    <fieldset>
+      <legend>Venues</legend>
+      <div class="search-row">
+        <input id="venue-search" class="search-input" type="search" placeholder="Find a venue" aria-label="Find a venue" autocomplete="off" />
+        <button id="select-all" class="modal-btn">Select all</button>
+        <button id="select-none" class="modal-btn">Clear</button>
+      </div>
+      <div id="venue-groups"></div>
+      <p id="venues-empty" hidden>No matching venues</p>
+    </fieldset>
+  </div>
+  <form method="dialog" class="modal-actions">
+    <button id="reset-filters" type="button" class="modal-btn">Reset</button>
+    <button class="modal-btn">Done</button>
+  </form>
+</dialog>
 <dialog id="bibtex-modal" class="modal" aria-labelledby="bibtex-heading">
   <div class="modal-header">
     <h3 id="bibtex-heading">BibTeX</h3>
@@ -58,6 +88,6 @@
     <button id="modal-download" class="modal-btn">Download</button>
   </div>
 </dialog>
-<script src="static/app.js"></script>
+<script type="module" src="static/app.js"></script>
 </body>
 </html>

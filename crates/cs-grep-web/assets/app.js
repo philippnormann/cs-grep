@@ -1,10 +1,12 @@
+import { byId, el } from './dom.js';
+import { initFilters, scopeText, venueParam } from './filters.js';
+
 const PAGE_SIZE = 120;
 const LOAD_MARGIN = 200;
 const SEARCH_DEBOUNCE_MS = 300;
-const byId = (id) => document.getElementById(id);
 const dom = {
   search: byId('search'),
-  sortButtons: document.querySelectorAll('.sort-btn'),
+  sortButtons: document.querySelectorAll('[data-sort]'),
   status: byId('status'),
   results: byId('results'),
   sentinel: byId('sentinel'),
@@ -62,6 +64,8 @@ async function loadPage(reset) {
     limit: PAGE_SIZE,
     offset: reset ? 0 : state.nextOffset,
   });
+  const venues = venueParam();
+  if (venues != null) params.set('venues', venues);
   let error = '';
   let status = 0;
   try {
@@ -210,11 +214,14 @@ function renderStatus(error = '', retry = null) {
   const more = state.nextOffset == null ? '' : '+';
   const summary = count ? `${count}${more} paper${count === 1 ? '' : 's'}` : 'No papers found';
   dom.status.replaceChildren(el('span', '', summary));
+  const scope = scopeText();
+  if (scope) dom.status.appendChild(el('span', '', scope));
   if (state.loading) dom.status.appendChild(el('span', 'spinner', 'Loading…'));
 }
 
 function onNavigation(event) {
-  if (event.defaultPrevented || event.isComposing || dom.modal.open) return;
+  // An open dialog has its own controls, which result shortcuts would hijack.
+  if (event.defaultPrevented || event.isComposing || document.querySelector('dialog[open]')) return;
   if (event.metaKey || event.ctrlKey || event.altKey) return;
   if (event.target === dom.results && (event.key.length === 1 || event.key === 'Backspace')) {
     // Typing in the result list goes to the search box.
@@ -291,13 +298,6 @@ function downloadBibtex() {
   dom.modalStatus.textContent = '';
 }
 
-function el(tag, className = '', text = '') {
-  const element = document.createElement(tag);
-  element.className = className;
-  element.textContent = text;
-  return element;
-}
-
 function labeledBlock(className, label, text) {
   const block = el('div', className);
   block.appendChild(el('strong', '', label));
@@ -328,8 +328,14 @@ dom.sortButtons.forEach((button) => {
   });
 });
 dom.modalClose.addEventListener('click', () => dom.modal.close());
-dom.modal.addEventListener('click', (event) => {
-  if (event.target === dom.modal) dom.modal.close();
+// Clicking the backdrop closes a dialog in every browser. Only a press that starts on the
+// backdrop counts, so dragging a text selection out of a dialog doesn't close it.
+document.querySelectorAll('dialog').forEach((dialog) => {
+  let pressedBackdrop = false;
+  dialog.addEventListener('mousedown', (event) => { pressedBackdrop = event.target === dialog; });
+  dialog.addEventListener('click', (event) => {
+    if (pressedBackdrop && event.target === dialog) dialog.close();
+  });
 });
 dom.modal.addEventListener('close', () => {
   // Reopening before this event fires has already started a new request.
@@ -346,5 +352,5 @@ window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', (e
   if (localStorage.getItem('theme')) return;
   document.documentElement.dataset.theme = event.matches ? 'light' : 'dark';
 });
-startSearch();
+initFilters(startSearch).then(() => startSearch());
 dom.search.focus();

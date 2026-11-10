@@ -32,7 +32,15 @@ const INDEX_HTML: &str = asset!("index.html");
 /// Files served under `/static/`, as (name, content type, contents).
 const STATIC_ASSETS: &[(&str, &str, &str)] = &[
     ("styles.css", "text/css", asset!("styles.css")),
+    ("filters.css", "text/css", asset!("filters.css")),
     ("app.js", "application/javascript", asset!("app.js")),
+    ("dom.js", "application/javascript", asset!("dom.js")),
+    ("filters.js", "application/javascript", asset!("filters.js")),
+    (
+        "venue-selection.js",
+        "application/javascript",
+        asset!("venue-selection.js"),
+    ),
 ];
 const MAX_LIMIT: usize = 500;
 const MAX_QUERY_BYTES: usize = 4096;

@@ -236,6 +236,10 @@ With Nix, run `nix run "github:philippnormann/cs-grep#csGrepWeb"`. Pass
 `--host 0.0.0.0` to allow remote access, and see `cs-grep-web --help` for other
 options. Restart the server after changing venues.
 
+The Filters panel narrows results by topic, venue rank, or single venues.
+Topics combine, and active filters are kept in the page URL, so a filtered view
+can be bookmarked or shared.
+
 ### Docker
 
 ```sh

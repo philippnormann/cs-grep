@@ -15,7 +15,9 @@
   --color-error: #ef4444;
 }
 
+:root { color-scheme: dark; } /* Native controls follow the theme. */
 :root[data-theme="light"] {
+  color-scheme: light;
   --color-bg: #ffffff;
   --color-text: #0f172a;
   --color-surface: #f8fafc;
@@ -219,6 +221,7 @@ body {
 .download-btn {
   margin-left: 0.5rem;
 }
+[hidden] { display: none !important; }
 .status {
   font-size: 0.875rem;
   color: var(--color-muted);
