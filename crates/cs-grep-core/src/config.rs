@@ -1,6 +1,6 @@
 //! Venue catalog, secrets, and filesystem paths.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
@@ -15,6 +15,7 @@ const BUNDLED_VENUES: &[(&str, &str)] = &[
     ("se", include_str!("../venues/se.yaml")),
     ("hci", include_str!("../venues/hci.yaml")),
 ];
+const BUNDLED_TAG_LABELS: &str = include_str!("../venues/tags.yaml");
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Venue {
@@ -64,6 +65,9 @@ pub struct Config {
     pub defaults: Defaults,
     #[serde(default)]
     pub venues: Vec<Venue>,
+    /// Display names for venue tags, e.g. `pl: Programming Languages`.
+    #[serde(default)]
+    pub tag_labels: BTreeMap<String, String>,
 }
 
 pub type RankSortOrder = Vec<Vec<String>>;
@@ -74,6 +78,8 @@ struct ConfigFile {
     defaults: Option<Defaults>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     venues: Vec<Venue>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    tags: BTreeMap<String, String>,
 }
 
 impl ConfigFile {
@@ -110,6 +116,7 @@ impl Config {
             bundles: Some(default_bundles()),
             defaults: Some(Defaults::default()),
             venues: Vec::new(),
+            tags: BTreeMap::new(),
         })?)
     }
 
@@ -137,11 +144,13 @@ impl Config {
             bundles: bundles.clone(),
             defaults: file.defaults.unwrap_or_default(),
             venues: Vec::new(),
+            tag_labels: serde_yaml::from_str(BUNDLED_TAG_LABELS)?,
         };
         for bundle in &bundles {
             cfg.merge_bundle(bundle)?;
         }
         cfg.merge_venues(file.venues);
+        cfg.tag_labels.extend(file.tags);
         Ok(cfg)
     }
 
@@ -454,6 +463,34 @@ mod tests {
     }
 
     #[test]
+    fn every_bundled_tag_has_a_label() {
+        let labels: BTreeMap<String, String> = serde_yaml::from_str(BUNDLED_TAG_LABELS).unwrap();
+        for (bundle, yaml) in BUNDLED_VENUES {
+            let bundle_file: BundleFile = serde_yaml::from_str(yaml).unwrap();
+            for tag in bundle_file.venues.iter().flat_map(|venue| &venue.tags) {
+                assert!(
+                    labels.contains_key(tag),
+                    "{bundle} uses unlabeled tag {tag}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn user_tag_labels_override_bundled_ones() {
+        let cfg =
+            Config::from_yaml("bundles: [security]\ntags:\n  security: Sec\n  pl: PL\n").unwrap();
+        assert_eq!(cfg.tag_labels["security"], "Sec");
+        assert_eq!(cfg.tag_labels["ml"], "Machine Learning");
+        assert_eq!(cfg.tag_labels["pl"], "PL");
+        // Labels don't depend on which bundles are loaded.
+        assert_eq!(
+            Config::from_yaml("bundles: []\n").unwrap().tag_labels["hci"],
+            "HCI"
+        );
+    }
+
+    #[test]
     fn later_streams_follow_config_order() {
         let mut cfg = Config::from_yaml("bundles: []\n").unwrap();
         cfg.merge_venues(vec![
@@ -605,6 +642,7 @@ venues:
                 venue("ASTAR2", "A*", &[]),
                 venue("UNRANKED", "", &[]),
             ],
+            tag_labels: BTreeMap::new(),
         };
         let groups = cfg.rank_sort_order();
         assert_eq!(

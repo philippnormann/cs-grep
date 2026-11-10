@@ -1,0 +1,10 @@
+# Display names for the venue tags used by the bundled catalogs.
+# Tags are shared across bundles, so their names live here once.
+# A user config can add or rename tags with its own `tags:` map.
+
+security: Security
+ml: Machine Learning
+nlp: NLP
+cv: Computer Vision
+se: Software Engineering
+hci: HCI

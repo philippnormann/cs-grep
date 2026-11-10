@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,17 +14,26 @@ use axum::{
     Json, Router,
 };
 use clap::Parser;
-use cs_grep_core::config::Config;
+use cs_grep_core::config::{Config, Venue};
 use cs_grep_core::db::{Database, Search, Sort};
-use cs_grep_core::query;
+use cs_grep_core::query::{self, FilterExpr};
 use cs_grep_core::{output, Paper};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
-const INDEX_HTML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/index.html"));
-const STYLES_CSS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/styles.css"));
-const APP_JS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/app.js"));
+macro_rules! asset {
+    ($name:literal) => {
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/", $name))
+    };
+}
+
+const INDEX_HTML: &str = asset!("index.html");
+/// Files served under `/static/`, as (name, content type, contents).
+const STATIC_ASSETS: &[(&str, &str, &str)] = &[
+    ("styles.css", "text/css", asset!("styles.css")),
+    ("app.js", "application/javascript", asset!("app.js")),
+];
 const MAX_LIMIT: usize = 500;
 const MAX_QUERY_BYTES: usize = 4096;
 const MAX_DB_JOBS: usize = 8;
@@ -179,6 +188,8 @@ struct SearchParams {
     limit: usize,
     #[serde(default)]
     offset: usize,
+    /// Comma-separated venue ids. Omitted means all venues; empty means none.
+    venues: Option<String>,
 }
 
 fn default_limit() -> usize {
@@ -241,18 +252,18 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn router(state: AppState) -> Router {
-    Router::new()
+    let mut router = Router::new()
         .route("/", get(|| async { Html(INDEX_HTML) }))
         .route("/api/search", get(api_search))
-        .route(
-            "/static/styles.css",
-            get(|| async { ([(header::CONTENT_TYPE, "text/css")], STYLES_CSS) }),
-        )
-        .route(
-            "/static/app.js",
-            get(|| async { ([(header::CONTENT_TYPE, "application/javascript")], APP_JS) }),
-        )
         .route("/api/bibtex", get(api_bibtex))
+        .route("/api/venues", get(api_venues));
+    for &(name, content_type, contents) in STATIC_ASSETS {
+        router = router.route(
+            &format!("/static/{name}"),
+            get(move || async move { ([(header::CONTENT_TYPE, content_type)], contents) }),
+        );
+    }
+    router
         .fallback(|| async { ApiError(StatusCode::NOT_FOUND, "not found".into()) })
         .method_not_allowed_fallback(|| async {
             ApiError(StatusCode::METHOD_NOT_ALLOWED, "method not allowed".into())
@@ -287,9 +298,27 @@ async fn api_search(
         _ => return Err(bad_request("sort must be year, relevance, venue, or rank")),
     };
     let parsed = query::parse(&params.q, &state.config).map_err(bad_request)?;
+    let mut filter = parsed.filter;
+    if let Some(venues) = &params.venues {
+        let selectors: Vec<String> = venues
+            .split(',')
+            .filter(|id| !id.is_empty())
+            .map(String::from)
+            .collect();
+        let selected = FilterExpr::Venue(
+            state
+                .config
+                .resolve_venues(&selectors)
+                .map_err(bad_request)?,
+        );
+        filter = Some(match filter {
+            Some(typed) => FilterExpr::And(vec![typed, selected]),
+            None => selected,
+        });
+    }
     let search = Search {
         fts: parsed.fts,
-        filter: parsed.filter,
+        filter,
         sort,
         limit: Some(params.limit + 1),
         offset: Some(params.offset),
@@ -302,6 +331,19 @@ async fn api_search(
         next_offset,
         ranks: (*state.ranks).clone(),
     }))
+}
+
+#[derive(Serialize)]
+struct VenuesResponse {
+    venues: Vec<Venue>,
+    tags: BTreeMap<String, String>,
+}
+
+async fn api_venues(State(state): State<AppState>) -> Json<VenuesResponse> {
+    Json(VenuesResponse {
+        venues: state.config.venues.clone(),
+        tags: state.config.tag_labels.clone(),
+    })
 }
 
 async fn api_bibtex(
@@ -394,6 +436,32 @@ mod tests {
             assert_eq!(result["papers"].as_array().unwrap().len(), 1);
             assert_eq!(result["papers"][0]["dblp_key"], "k1");
         }
+    }
+
+    #[tokio::test]
+    async fn venue_selection_narrows_typed_filters() {
+        let (_dir, app) = test_app();
+        let keys = |result: serde_json::Value| -> Vec<String> {
+            let papers = result["papers"].as_array().unwrap();
+            papers
+                .iter()
+                .map(|p| p["dblp_key"].as_str().unwrap().into())
+                .collect()
+        };
+        for (params, expected) in [
+            ("venues=NDSS,ccs,NDSS", vec!["k2", "k1"]),
+            ("venues=", vec![]),
+            ("venues=SP&q=*+WHERE+venue:SP+OR+venue:NDSS", vec!["k3"]),
+        ] {
+            let result = json(request(app.clone(), &format!("/api/search?{params}")).await).await;
+            assert_eq!(keys(result), expected, "{params}");
+        }
+        let response = request(app.clone(), "/api/search?venues=NDSS,nope").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let catalog = json(request(app, "/api/venues").await).await;
+        let venues = catalog["venues"].as_array().unwrap();
+        assert!(venues.iter().any(|v| v["id"] == "NDSS"));
+        assert_eq!(catalog["tags"]["ml"], "Machine Learning");
     }
 
     #[tokio::test]
@@ -504,13 +572,14 @@ mod tests {
     #[tokio::test]
     async fn production_routes_serve_assets_and_json_errors() {
         let (_dir, app) = test_app();
-        for (uri, content_type) in [
-            ("/", "text/html; charset=utf-8"),
-            ("/static/styles.css", "text/css"),
-            ("/static/app.js", "application/javascript"),
-        ] {
-            let response = request(app.clone(), uri).await;
-            assert_eq!(response.status(), StatusCode::OK);
+        let assets = STATIC_ASSETS
+            .iter()
+            .map(|(name, content_type, _)| (format!("/static/{name}"), *content_type));
+        for (uri, content_type) in
+            std::iter::once(("/".to_string(), "text/html; charset=utf-8")).chain(assets)
+        {
+            let response = request(app.clone(), &uri).await;
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
             assert_eq!(response.headers()[header::CONTENT_TYPE], content_type);
         }
         for uri in ["/api/unknown", "/unknown"] {

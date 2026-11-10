@@ -799,6 +799,7 @@ mod tests {
                     tags: Vec::new(),
                 })
                 .collect(),
+            tag_labels: Default::default(),
         }
     }
 

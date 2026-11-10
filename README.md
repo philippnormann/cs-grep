@@ -140,13 +140,18 @@ You can also pass a specific file with `--config path/to/config.yaml`.
 
 `bundles` selects bundled venue sets for subfields. User venues are always
 merged after selected bundles by `id`: reuse an existing `id` to override a
-bundled venue, or add a new `id` to extend the catalog.
+bundled venue, or add a new `id` to extend the catalog. `tags` gives tags the
+display names shown by the web UI's topic filters; a tag without one shows its
+id.
 
 ```yaml
 bundles: [security, ml, se]
 
 defaults:
   min_year: 2018
+
+tags:
+  malware: Malware Analysis
 
 venues:
   - id: DIMVA
@@ -268,6 +273,7 @@ changing venues, copy the config in with
 | `sort` | `year` (default), `relevance`, `venue`, or `rank` |
 | `limit` | Results per page, 1-500 (default 120) |
 | `offset` | Results to skip (default 0) |
+| `venues` | Comma-separated venue ids or aliases to search in, ANDed with `q`. Omitted searches all venues; empty searches none. |
 
 ```sh
 curl 'http://localhost:5002/api/search?q=fuzzing+WHERE+venue:NDSS+AND+year:2024&limit=1'
@@ -294,6 +300,11 @@ curl 'http://localhost:5002/api/search?q=fuzzing+WHERE+venue:NDSS+AND+year:2024&
 
 For the next page, pass `next_offset` as `offset`. It is `null` on the last
 page. `ranks` maps each venue to its rank.
+
+#### `GET /api/venues`
+
+Returns the venue catalog as `{"venues": [...], "tags": {"ml": "Machine Learning", ...}}`.
+Each venue has `id`, `name`, `dblp_stream`, `aliases`, `rank`, and `tags`.
 
 #### `GET /api/bibtex?key=<dblp_key>`
 
