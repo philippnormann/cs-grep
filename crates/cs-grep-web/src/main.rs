@@ -213,6 +213,9 @@ struct BibtexParams {
 struct SearchResponse {
     papers: Vec<Paper>,
     next_offset: Option<usize>,
+    /// All matching papers; counted on the first page only, so scrolling stays fast.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total: Option<usize>,
     ranks: HashMap<String, String>,
 }
 
@@ -331,12 +334,19 @@ async fn api_search(
         limit: Some(params.limit + 1),
         offset: Some(params.offset),
     };
-    let mut papers = state.with_db(move |db| db.search(&search)).await?;
+    let first_page = params.offset == 0;
+    let (mut papers, total) = state
+        .with_db(move |db| {
+            let total = first_page.then(|| db.search_count(&search)).transpose()?;
+            Ok((db.search(&search)?, total))
+        })
+        .await?;
     let next_offset = (papers.len() > params.limit).then_some(params.offset + params.limit);
     papers.truncate(params.limit);
     Ok(Json(SearchResponse {
         papers,
         next_offset,
+        total,
         ranks: (*state.ranks).clone(),
     }))
 }
@@ -424,10 +434,12 @@ mod tests {
         assert_eq!(first["papers"][0]["dblp_key"], "k2");
         assert_eq!(first["papers"][1]["dblp_key"], "k1");
         assert_eq!(first["next_offset"], 2);
+        assert_eq!(first["total"], 3);
         assert_eq!(first["ranks"]["NDSS"], "A*");
         let last = json(request(app.clone(), "/api/search?limit=1&offset=2").await).await;
         assert_eq!(last["papers"][0]["dblp_key"], "k3");
         assert_eq!(last["next_offset"], serde_json::Value::Null);
+        assert!(last.get("total").is_none(), "later pages skip the count");
         let empty = json(request(app.clone(), "/api/search?offset=3").await).await;
         assert!(empty["papers"].as_array().unwrap().is_empty());
         assert_eq!(empty["next_offset"], serde_json::Value::Null);

@@ -298,12 +298,14 @@ curl 'http://localhost:5002/api/search?q=fuzzing+WHERE+venue:NDSS+AND+year:2024&
     }
   ],
   "next_offset": 1,
+  "total": 10,
   "ranks": { "NDSS": "A*", "CCS": "A*" }
 }
 ```
 
 For the next page, pass `next_offset` as `offset`. It is `null` on the last
-page. `ranks` maps each venue to its rank.
+page. `total` counts all matching papers and is only included on the first
+page (`offset` 0). `ranks` maps each venue to its rank.
 
 #### `GET /api/venues`
 

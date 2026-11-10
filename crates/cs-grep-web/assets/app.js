@@ -25,6 +25,7 @@ const state = {
   ranks: {},
   selected: null,
   nextOffset: null,
+  total: null, // All papers matching the current search, as counted by the server.
   loading: false,
 };
 let searchController;
@@ -91,6 +92,7 @@ async function loadPage(reset) {
     dom.sentinel.before(createRows(data.papers, state.results.length));
     state.results.push(...data.papers);
     state.nextOffset = data.next_offset;
+    if (reset) state.total = data.total;
     if (reset) renderDetail();
   } catch (e) {
     error = e.message || 'Search failed';
@@ -214,9 +216,8 @@ function renderStatus(error = '', retry = null) {
     dom.status.replaceChildren(el('span', '', 'Loading…'));
     return;
   }
-  const count = state.results.length;
-  const more = state.nextOffset == null ? '' : '+';
-  const summary = count ? `${count}${more} paper${count === 1 ? '' : 's'}` : 'No papers found';
+  const count = state.total;
+  const summary = count ? `${count.toLocaleString('en')} paper${count === 1 ? '' : 's'}` : 'No papers found';
   dom.status.replaceChildren(el('span', '', summary));
   const scope = scopeText();
   if (scope) dom.status.appendChild(el('span', '', scope));
