@@ -223,6 +223,8 @@ OPENREVIEW_PASSWORD=
 
 ## Web UI
 
+![cs-grep web UI](assets/web-ui.png)
+
 `cs-grep-web` serves a search page for your cs-grep database. It's useful for
 hosting one instance for your group, so everyone can search the same database
 without installing anything.
