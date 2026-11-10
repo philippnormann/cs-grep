@@ -1,4 +1,4 @@
-import { byId, el } from './dom.js';
+import { byId, el, setUrlParams } from './dom.js';
 import { initFilters, scopeText, venueParam } from './filters.js';
 
 const PAGE_SIZE = 120;
@@ -43,7 +43,11 @@ function startSearch(delay = 0) {
   state.loading = true;
   renderDetail();
   renderStatus();
-  debounceTimer = setTimeout(() => loadPage(true), delay);
+  debounceTimer = setTimeout(() => {
+    // The search text and sort live in the URL too, so a shared link reproduces the view.
+    setUrlParams({ q: dom.search.value || null, sort: state.sort === 'year' ? null : state.sort });
+    loadPage(true);
+  }, delay);
 }
 
 function loadIfNearEnd() {
@@ -316,14 +320,18 @@ dom.results.addEventListener('dblclick', (event) => {
 });
 new IntersectionObserver(loadIfNearEnd, { root: dom.results, rootMargin: `${LOAD_MARGIN}px` })
   .observe(dom.sentinel);
+function setSort(sort) {
+  state.sort = sort;
+  dom.sortButtons.forEach((item) => {
+    item.classList.toggle('active', item.dataset.sort === sort);
+    item.setAttribute('aria-pressed', item.dataset.sort === sort);
+  });
+}
+
 dom.sortButtons.forEach((button) => {
   button.addEventListener('click', () => {
     if (state.sort === button.dataset.sort) return;
-    state.sort = button.dataset.sort;
-    dom.sortButtons.forEach((item) => {
-      item.classList.toggle('active', item === button);
-      item.setAttribute('aria-pressed', item === button);
-    });
+    setSort(button.dataset.sort);
     startSearch();
   });
 });
@@ -352,5 +360,10 @@ window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', (e
   if (localStorage.getItem('theme')) return;
   document.documentElement.dataset.theme = event.matches ? 'light' : 'dark';
 });
+// Restore a shared view: search text and sort from the URL, filters in initFilters.
+const urlParams = new URLSearchParams(location.search);
+dom.search.value = urlParams.get('q') ?? '';
+const sortFromUrl = urlParams.get('sort');
+if ([...dom.sortButtons].some((button) => button.dataset.sort === sortFromUrl)) setSort(sortFromUrl);
 initFilters(startSearch).then(() => startSearch());
 dom.search.focus();

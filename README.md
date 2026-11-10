@@ -237,8 +237,8 @@ With Nix, run `nix run "github:philippnormann/cs-grep#csGrepWeb"`. Pass
 options. Restart the server after changing venues.
 
 The Filters panel narrows results by topic, venue rank, or single venues.
-Topics combine, and active filters are kept in the page URL, so a filtered view
-can be bookmarked or shared.
+Topics combine. The search, sort, and active filters are kept in the page URL,
+so a view can be bookmarked or shared.
 
 ### Docker
 

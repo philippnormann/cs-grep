@@ -2,7 +2,7 @@
 // It owns the filter state and the `venues`/`rank` URL parameters, and tells the page through
 // `onChange` whenever the searched venues change.
 
-import { byId, el } from './dom.js';
+import { byId, el, setUrlParams } from './dom.js';
 import { VenueSelection } from './venue-selection.js';
 
 const dom = {
@@ -51,21 +51,9 @@ export async function initFilters(onChange) {
 
 function update(change) {
   change();
-  syncUrl();
+  setUrlParams(selection.urlParams());
   render();
   notifyChange();
-}
-
-function syncUrl() {
-  const { venues, rank } = selection.urlParams();
-  const params = new URLSearchParams(location.search);
-  params.delete('venues');
-  params.delete('rank');
-  if (venues != null) params.set('venues', venues);
-  if (rank) params.set('rank', rank);
-  // Shared links keep readable commas instead of %2C.
-  const query = params.toString().replaceAll('%2C', ',');
-  history.replaceState(null, '', `${location.pathname}${query ? `?${query}` : ''}${location.hash}`);
 }
 
 // Building the dialog, once per catalog
