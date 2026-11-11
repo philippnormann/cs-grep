@@ -84,6 +84,15 @@ fn abstract_from_openalex(work: &Value) -> Option<String> {
     )
 }
 
+/// Flattened publisher JATS keeps the "Abstract" heading and shows formulas twice;
+/// Crossref has the markup to drop both.
+fn is_jats_dump(text: &str) -> bool {
+    text.contains("$$")
+        || text
+            .strip_prefix("Abstract ")
+            .is_some_and(|rest| rest.starts_with(char::is_uppercase))
+}
+
 fn abstract_from_semantic_scholar(paper: &Value) -> Option<String> {
     paper
         .get("abstract")
@@ -248,6 +257,12 @@ pub fn usable_abstract_for_title(raw: String, title: &str) -> Option<String> {
     (!titles_match(&abstract_text, title)).then_some(abstract_text)
 }
 
+/// Re-checks a stored abstract; a flattened JATS dump is cleared so the next enrich
+/// fetches the clean Crossref text.
+pub fn recheck_stored_abstract(raw: String, title: &str) -> Option<String> {
+    usable_abstract_for_title(raw, title).filter(|abs| !is_jats_dump(abs))
+}
+
 fn normalized_doi(raw: &str) -> Option<String> {
     let trimmed = raw.trim().trim_end_matches('.');
     let lower = trimmed.to_ascii_lowercase();
@@ -298,7 +313,26 @@ fn openreview_content_value(value: &Value) -> Option<String> {
 fn abstract_from_crossref(message: &Value) -> Option<String> {
     let raw = message.get("abstract").and_then(|v| v.as_str())?;
     let doc = Html::parse_fragment(raw);
-    element_text(doc.root_element())
+    // a deposit with no space next to any tag lost them all: "formula<jats:italic>F</jats:italic>in"
+    let spaced = raw
+        .split(['<', '>'])
+        .any(|part| part.starts_with(char::is_whitespace) || part.ends_with(char::is_whitespace));
+    // the heading and the TeX twin of a MathML formula are not abstract text
+    let skip = Selector::parse(r"jats\:title, jats\:alternatives > jats\:tex-math")
+        .expect("valid selector");
+    let text = doc
+        .root_element()
+        .descendants()
+        .filter(|node| {
+            !node
+                .ancestors()
+                .filter_map(ElementRef::wrap)
+                .any(|element| skip.matches(&element))
+        })
+        .filter_map(|node| node.value().as_text().map(|text| &**text))
+        .collect::<Vec<_>>()
+        .join(if spaced { "" } else { " " });
+    non_empty_text(text)
 }
 
 fn crossref_title_matches(message: &Value, expected: &str) -> bool {
@@ -845,6 +879,7 @@ impl Enricher {
         let enricher = &*self;
         stream::iter(inputs.into_iter().map(|paper| async move {
             let result = match cached_doi_abstract(doi_cache, &paper)
+                .filter(|abs| !is_jats_dump(abs))
                 .or_else(|| cached_openreview_abstract(openreview_cache, &paper))
             {
                 Some(abs) => Ok(EnrichResult::Found(abs)),
@@ -992,8 +1027,9 @@ impl Enricher {
 
     async fn api_by_doi(&self, paper: &Paper, transient: &mut Option<String>) -> Option<String> {
         let doi = paper.doi.as_deref().and_then(normalized_doi)?;
-        if !self.doi_cache.contains_key(&doi) {
-            if let Some(abs) = ok_or_note(
+        let found = match self.doi_cache.get(&doi) {
+            Some(cached) => cached.clone(),
+            None => ok_or_note(
                 "OpenAlex",
                 self.fetch_openalex_json(&format!("https://api.openalex.org/works/doi:{doi}"), &[])
                     .await,
@@ -1001,10 +1037,10 @@ impl Enricher {
             )
             .filter(|json| json_doi_title_matches(json, &paper.title))
             .and_then(|json| abstract_from_openalex(&json))
-            .and_then(|abs| usable_abstract_for_title(abs, &paper.title))
-            {
-                return Some(abs);
-            }
+            .and_then(|abs| usable_abstract_for_title(abs, &paper.title)),
+        };
+        if found.as_deref().is_some_and(|abs| !is_jats_dump(abs)) {
+            return found;
         }
 
         let cr = self
@@ -1015,6 +1051,7 @@ impl Enricher {
             .filter(|message| crossref_title_matches(message, &paper.title))
             .and_then(|message| abstract_from_crossref(&message))
             .and_then(|abs| usable_abstract_for_title(abs, &paper.title))
+            .or(found)
     }
 
     async fn openalex_doi_abstracts(
@@ -1692,6 +1729,21 @@ mod tests {
     }
 
     #[test]
+    fn jats_dumps_are_recognized() {
+        assert!(is_jats_dump("Abstract To ensure privacy, we design"));
+        assert!(is_jats_dump("Paths for $$\\omega $$ ω -regular objectives"));
+        assert!(!is_jats_dump("Abstract interpretation is sound."));
+        assert!(!is_jats_dump("We fuzz the kernel."));
+        assert_eq!(
+            recheck_stored_abstract(
+                "Abstract To ensure privacy, we design a protocol.".into(),
+                "T"
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn openalex_plain_abstract() {
         let work = json!({ "abstract": "Direct text." });
         assert_eq!(
@@ -2338,6 +2390,28 @@ mod tests {
         assert_eq!(
             abstract_from_crossref(&msg).as_deref(),
             Some("A bold claim.")
+        );
+    }
+
+    #[test]
+    fn crossref_drops_heading_and_tex_alternate() {
+        let msg = json!({"abstract": "<jats:title>Abstract</jats:title><jats:p>Paths for \
+            <jats:inline-formula><jats:alternatives><jats:tex-math>$$\\omega $$</jats:tex-math>\
+            <mml:math><mml:mi>ω</mml:mi></mml:math></jats:alternatives></jats:inline-formula>\
+            -regular objectives.</jats:p>"});
+        assert_eq!(
+            abstract_from_crossref(&msg).as_deref(),
+            Some("Paths for ω-regular objectives.")
+        );
+    }
+
+    #[test]
+    fn crossref_respaces_a_deposit_without_spaces_around_tags() {
+        let msg =
+            json!({"abstract": "<jats:p>A formula<jats:italic>F</jats:italic>in CNF.</jats:p>"});
+        assert_eq!(
+            abstract_from_crossref(&msg).as_deref(),
+            Some("A formula F in CNF.")
         );
     }
 
