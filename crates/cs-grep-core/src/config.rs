@@ -407,6 +407,8 @@ mod tests {
                     "ESORICS",
                     "AsiaCCS",
                     "EuroSP",
+                    "PETS",
+                    "CSF",
                     "AISec",
                     "SaTML",
                     "SOUPS",
@@ -428,7 +430,7 @@ mod tests {
                 "crypto",
                 &["CRYPTO", "EUROCRYPT", "ASIACRYPT", "CHES", "FC"],
             ),
-            ("formal", &["CAV", "TACAS", "LICS"]),
+            ("formal", &["CAV", "TACAS", "LICS", "CSF"]),
             ("pl", &["POPL", "PLDI"]),
         ];
 

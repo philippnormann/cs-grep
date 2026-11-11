@@ -66,6 +66,20 @@ venues:
     rank: A
     tags: [security]
 
+  - id: PETS
+    name: Privacy Enhancing Technologies Symposium
+    dblp_stream: journals/popets
+    aliases: [pets, popets]
+    rank: A
+    tags: [security]
+
+  - id: CSF
+    name: IEEE Computer Security Foundations Symposium
+    dblp_stream: conf/csfw
+    aliases: [csf, csfw]
+    rank: A
+    tags: [security, formal]
+
   - id: AISec
     name: ACM Workshop on Artificial Intelligence and Security
     dblp_stream: conf/aisec-ws
@@ -77,7 +91,6 @@ venues:
     name: IEEE Conference on Secure and Trustworthy Machine Learning
     dblp_stream: conf/satml
     aliases: [satml]
-    rank: A
     tags: [security, ml]
 
   - id: SOUPS
