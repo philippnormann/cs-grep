@@ -106,9 +106,9 @@ cs-grep '* WHERE tag:ml OR tag:security'
 
 Bundles choose which venue catalogs `update` and `enrich` process. Tags filter
 papers by venue family during search. Bundled venues use the broad tags
-`security`, `ml`, `nlp`, `cv`, `se`, `hci`, and `crypto`; custom venues can
-define additional tags. The default bundles are `security`, `ml`, and `se`;
-`hci` and `crypto` are available separately.
+`security`, `ml`, `nlp`, `cv`, `se`, `hci`, `crypto`, `formal`, and `pl`;
+custom venues can define additional tags. The default bundles are `security`,
+`ml`, and `se`; `hci`, `crypto`, and `formal` are available separately.
 
 ```sh
 cs-grep update --bundle security,ml

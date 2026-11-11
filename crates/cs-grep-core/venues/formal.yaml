@@ -1,0 +1,39 @@
+# Formal methods and programming languages venues bundled with cs-grep.
+# Order matters: a paper listed in several venues is stored under the last one,
+# so list workshops and co-located venues after their host.
+
+venues:
+  - id: CAV
+    name: International Conference on Computer Aided Verification
+    dblp_stream: conf/cav
+    aliases: [cav]
+    rank: A*
+    tags: [formal]
+
+  - id: TACAS
+    name: International Conference on Tools and Algorithms for the Construction and Analysis of Systems
+    dblp_stream: conf/tacas
+    aliases: [tacas]
+    rank: A
+    tags: [formal]
+
+  - id: LICS
+    name: ACM/IEEE Symposium on Logic in Computer Science
+    dblp_stream: conf/lics
+    aliases: [lics]
+    rank: A*
+    tags: [formal]
+
+  - id: POPL
+    name: ACM SIGPLAN Symposium on Principles of Programming Languages
+    dblp_stream: conf/popl
+    aliases: [popl]
+    rank: A*
+    tags: [pl]
+
+  - id: PLDI
+    name: ACM SIGPLAN Conference on Programming Language Design and Implementation
+    dblp_stream: conf/pldi
+    aliases: [pldi]
+    rank: A*
+    tags: [pl]
