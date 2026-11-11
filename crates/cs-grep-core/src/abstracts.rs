@@ -38,7 +38,7 @@ const TRANSIENT_RETRY_DELAY: Duration = Duration::from_millis(250);
 const STATIC_DNS_FAILED: &str = "static URL DNS lookup failed";
 /// Bump when sources, extractors or acceptance rules change: the next enrich
 /// re-checks stored abstracts and retries every remembered miss once.
-pub const ENRICH_VERSION: i32 = 1;
+pub const ENRICH_VERSION: i32 = 2;
 const MIN_ABSTRACT_CHARS: usize = 80;
 const MAX_ABSTRACT_CHARS: usize = 6_000;
 
@@ -509,6 +509,7 @@ const BOILERPLATE_PREFIXES: &[&str] = &[
     "Rights to individual papers remain",
     "(Article begins on next page)",
     "Provides notice of upcoming conference events",
+    "A clear and well-documented LaTeX document is presented",
 ];
 
 fn is_boilerplate_abstract(text: &str) -> bool {
@@ -1367,7 +1368,7 @@ fn is_allowed_static_host(url: &Url) -> bool {
     };
     matches!(
         host.trim_end_matches('.').to_ascii_lowercase().as_str(),
-        "aaai.org" | "www.aaai.org" | "ojs.aaai.org" | "iclr.cc" | "www.iclr.cc"
+        "aaai.org" | "www.aaai.org" | "ojs.aaai.org" | "iclr.cc" | "www.iclr.cc" | "tches.iacr.org"
     )
 }
 
@@ -1795,6 +1796,7 @@ mod tests {
             "Personal use of this material is permitted. However, permission to reprint/republish this material for advertising must be obtained from the IEEE.",
             "(Article begins on next page) The Harvard community has made this article openly available. Please share how this access benefits you. Your story matters.",
             "Provides notice of upcoming conference events of interest to practitioners and researchers.",
+            "A clear and well-documented LaTeX document is presented as an article formatted for publication by ACM in a conference proceedings or journal publication.",
             "Article A paper title Share on CCS '07: Proceedings of the 14th ACM conference Get Citation AlertsNew Citation Alert added! Save to BinderSave to BinderCreate a New Binder",
             "Contents List of Tables iv 1 Introduction 1 1.1 The Problem . . . . . . . . . . 1 1.2 Common Attacks . . . . . . . . . . 2 1.3 A Solution . . . . . 4",
         ] {
@@ -2723,6 +2725,7 @@ mod tests {
             "https://ojs.aaai.org/paper/1",
             "https://iclr.cc/paper/1",
             "https://www.iclr.cc/paper/1",
+            "https://tches.iacr.org/index.php/TCHES/article/view/1",
             "https://idp.springer.com/authorize",
         ] {
             assert_eq!(static_fetch_url(raw).unwrap().as_str(), raw);
